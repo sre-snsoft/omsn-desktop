@@ -23,6 +23,36 @@ pub mod fields {
     pub const MODIFIED: &str = "Modified";
 }
 
+/// Status values, verified against the live Base.
+///
+/// `THIS_WEEK` does not appear in the data today, but the OMSN plugin's
+/// validator accepts it, so it is treated as active rather than silently
+/// dropping such a task out of every view.
+pub mod status {
+    pub const BACKLOG: &str = "Backlog";
+    pub const THIS_WEEK: &str = "This Week";
+    pub const IN_PROGRESS: &str = "In Progress";
+    pub const ON_HOLD: &str = "On Hold";
+    pub const DONE: &str = "Done";
+}
+
+/// Priority values as stored in the Base — the full label, not a bare "P1".
+pub mod priority {
+    pub const P0: &str = "P0 - Critical";
+    pub const P1: &str = "P1 - Important";
+    pub const P2: &str = "P2 - Normal";
+
+    /// Sort rank, lowest first. Unknown or empty sorts last.
+    pub fn rank(value: Option<&str>) -> u8 {
+        match value {
+            Some(v) if v.starts_with("P0") => 0,
+            Some(v) if v.starts_with("P1") => 1,
+            Some(v) if v.starts_with("P2") => 2,
+            _ => 3,
+        }
+    }
+}
+
 /// An item older than this with no movement needs a decision at standup.
 pub const STALE_DAYS: i64 = 14;
 
@@ -134,7 +164,10 @@ impl Task {
     }
 
     pub fn is_active(&self) -> bool {
-        matches!(self.status.as_str(), "In Progress" | "On Hold" | "Backlog")
+        matches!(
+            self.status.as_str(),
+            status::IN_PROGRESS | status::ON_HOLD | status::BACKLOG | status::THIS_WEEK
+        )
     }
 
     /// Whole days since creation, using the supplied clock so tests are stable.
@@ -143,9 +176,19 @@ impl Task {
         Some((now.timestamp_millis() - created) / 86_400_000)
     }
 
-    /// Needs a decision: in flight, past the threshold, and nothing has moved.
+    /// Whole days since the record last changed.
+    pub fn days_since_movement(&self, now: DateTime<Utc>) -> Option<i64> {
+        let last = self.modified.or(self.created)?;
+        Some((now.timestamp_millis() - last) / 86_400_000)
+    }
+
+    /// Needs a decision: in flight and nothing has moved for STALE_DAYS.
+    ///
+    /// Measured from `Modified`, not `Created` — with the OMSN plugin writing
+    /// to the same table, a touch by either client counts as movement.
     pub fn needs_attention(&self, now: DateTime<Utc>) -> bool {
-        self.status == "In Progress" && self.age_days(now).is_some_and(|d| d >= STALE_DAYS)
+        self.status == status::IN_PROGRESS
+            && self.days_since_movement(now).is_some_and(|d| d >= STALE_DAYS)
     }
 }
 
@@ -263,6 +306,48 @@ mod tests {
             !Task::from_record("r".into(), &f).needs_attention(now()),
             "backlog is unscheduled, not rotting"
         );
+    }
+
+    #[test]
+    fn movement_resets_the_staleness_clock() {
+        // Created long ago, but touched yesterday — someone is on it.
+        let f = fields_of(json!({
+            "Status": "In Progress",
+            "Created": now().timestamp_millis() - 200 * 86_400_000i64,
+            "Modified": now().timestamp_millis() - 86_400_000i64,
+        }));
+        assert!(
+            !Task::from_record("r".into(), &f).needs_attention(now()),
+            "a recently touched task is moving, regardless of age"
+        );
+    }
+
+    #[test]
+    fn untouched_since_creation_still_counts_as_stale() {
+        let old = now().timestamp_millis() - 90 * 86_400_000i64;
+        let f = fields_of(json!({"Status": "In Progress", "Created": old}));
+        assert!(Task::from_record("r".into(), &f).needs_attention(now()));
+    }
+
+    #[test]
+    fn this_week_counts_as_active() {
+        let f = fields_of(json!({"Status": "This Week"}));
+        assert!(Task::from_record("r".into(), &f).is_active());
+    }
+
+    #[test]
+    fn done_is_not_active() {
+        let f = fields_of(json!({"Status": "Done"}));
+        assert!(!Task::from_record("r".into(), &f).is_active());
+    }
+
+    #[test]
+    fn priority_ranks_use_the_real_base_labels() {
+        assert_eq!(priority::rank(Some("P0 - Critical")), 0);
+        assert_eq!(priority::rank(Some("P1 - Important")), 1);
+        assert_eq!(priority::rank(Some("P2 - Normal")), 2);
+        assert_eq!(priority::rank(None), 3, "unset priority sorts last");
+        assert_eq!(priority::rank(Some("")), 3);
     }
 
     #[test]

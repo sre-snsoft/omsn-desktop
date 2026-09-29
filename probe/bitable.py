@@ -41,6 +41,17 @@ def _records_url(base_token: str, table_id: str, record_id: str = "") -> str:
     return f"{url}/{record_id}" if record_id else url
 
 
+def _require_record_id(record_id: str, operation: str) -> str:
+    """Refuse a single-record operation with no id.
+
+    An empty id silently degrades the URL to the records *collection*, which
+    would point a DELETE at the whole table instead of one row.
+    """
+    if not record_id or not record_id.strip():
+        raise BitableError(f"{operation} requires a record_id; refusing collection-wide call")
+    return record_id
+
+
 def list_records(token: str, base_token: str, table_id: str,
                  page_size: int = 20, page_token: str = "") -> dict:
     query = {"page_size": page_size}
@@ -52,15 +63,19 @@ def list_records(token: str, base_token: str, table_id: str,
 
 def create_record(token: str, base_token: str, table_id: str, fields: dict) -> dict:
     url = _records_url(base_token, table_id)
-    return _request("POST", url, token, {"fields": fields})["data"]["record"]
+    body = _request("POST", url, token, {"fields": fields})
+    record = body.get("data", {}).get("record")
+    if not isinstance(record, dict) or not record.get("record_id"):
+        raise BitableError(f"create returned no usable record: {list(body.get('data', {}))}")
+    return record
 
 
 def update_record(token: str, base_token: str, table_id: str,
                   record_id: str, fields: dict) -> dict:
-    url = _records_url(base_token, table_id, record_id)
+    url = _records_url(base_token, table_id, _require_record_id(record_id, "update"))
     return _request("PUT", url, token, {"fields": fields})["data"]["record"]
 
 
 def delete_record(token: str, base_token: str, table_id: str, record_id: str) -> bool:
-    url = _records_url(base_token, table_id, record_id)
+    url = _records_url(base_token, table_id, _require_record_id(record_id, "delete"))
     return _request("DELETE", url, token)["data"].get("deleted", False)

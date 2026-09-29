@@ -49,21 +49,42 @@ class ConfigError(RuntimeError):
 
 
 def save_tokens(tokens: dict, path: str = TOKEN_CACHE) -> None:
-    """Persist tokens for reuse, readable only by the current user."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """Persist tokens for reuse, readable only by the current user.
+
+    The mode argument to `os.open` applies only when it creates the file, so a
+    pre-existing world-readable cache would silently stay that way. Write to a
+    fresh temp file, force the mode, then move it into place — which also makes
+    the replacement atomic, so a crash cannot leave a half-written cache.
+    """
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+
+    tmp = f"{path}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(tokens, fh)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+    mode = os.stat(path).st_mode & 0o777
+    if mode != 0o600:
+        raise RuntimeError(f"Refusing to leave tokens at mode {mode:o} in {path}")
 
 
 def load_tokens(path: str = TOKEN_CACHE) -> dict:
-    """Return cached tokens, or an empty dict when none are stored."""
-    if not os.path.exists(path):
-        return {}
+    """Return cached tokens, or an empty dict when none are usable.
+
+    "No cache yet" is normal; anything else is reported rather than swallowed,
+    so a corrupt or unreadable cache does not silently look like a first run.
+    """
     try:
         with open(path, encoding="utf-8") as fh:
             return json.load(fh)
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        print(f"WARN: ignoring unusable token cache {path}: {exc}", file=sys.stderr)
         return {}
 
 
@@ -115,20 +136,40 @@ def load_config(path: str | None = None) -> Config:
     )
 
 
-def post_json(url: str, payload: dict, token: str | None = None) -> dict:
-    body = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json; charset=utf-8"}
+REQUEST_TIMEOUT_S = 30
+
+
+def _check_lark_code(body: dict, context: str) -> dict:
+    """Lark answers HTTP 200 with a non-zero `code` for most failures.
+
+    Every response must pass through here, or a failure is reported as success.
+    Only the safe fields are echoed — never the whole body, which can carry
+    tokens or an authorization code.
+    """
+    code = body.get("code")
+    if code not in (0, None):
+        raise RuntimeError(f"{context} failed: code={code} msg={body.get('msg')}")
+    return body
+
+
+def _send(url: str, method: str, token: str | None, payload: dict | None) -> dict:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {}
+    if data is not None:
+        headers["Content-Type"] = "application/json; charset=utf-8"
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=30, context=SSL_CONTEXT) as resp:
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S, context=SSL_CONTEXT) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def post_json(url: str, payload: dict, token: str | None = None) -> dict:
+    return _check_lark_code(_send(url, "POST", token, payload), f"POST {url}")
 
 
 def get_json(url: str, token: str) -> dict:
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    with urllib.request.urlopen(req, timeout=30, context=SSL_CONTEXT) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    return _check_lark_code(_send(url, "GET", token, None), f"GET {url}")
 
 
 class _CallbackHandler(http.server.BaseHTTPRequestHandler):
@@ -148,10 +189,17 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
         ok = "code" in type(self).result
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Security-Policy", "default-src 'none'")
         self.end_headers()
+        # Fixed strings only. Anything from the query string is attacker
+        # controllable — any page in the browser can hit this local port — and
+        # echoing it would both reflect script and put the auth code on screen.
         message = ("Authorized. You can close this tab and return to the terminal."
                    if ok else
-                   f"Authorization failed: {type(self).result}")
+                   "Authorization failed. Check the terminal for details.")
+        if not ok:
+            print(f"  callback error: {type(self).result.get('error', '(none)')}",
+                  file=sys.stderr)
         self.wfile.write(f"<html><body><h3>{message}</h3></body></html>".encode("utf-8"))
 
     def log_message(self, *_args):
