@@ -1,4 +1,6 @@
 pub mod error;
+pub mod repo;
+pub mod sync;
 pub mod task;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
