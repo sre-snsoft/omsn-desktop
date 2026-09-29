@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
 
-/** Rough height of one task row, used to decide how many fit. */
-const ROW_HEIGHT_PX = 62;
-/** Space taken by the titlebar, status line and pager. */
-const CHROME_PX = 150;
+/** Measured height of one task row (title + meta line + borders). */
+const ROW_HEIGHT_PX = 55;
+/** Titlebar (33) + pager (35) + list padding. */
+const CHROME_PX = 76;
 const MIN_PER_PAGE = 3;
 
 /**

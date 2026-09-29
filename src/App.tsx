@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import type { Snapshot, Task, UiError, Viewer } from './types';
 import { STATUS_ICON, daysSince, isStale, sortTasks } from './types';
 import { usePagination } from './usePagination';
@@ -73,8 +74,12 @@ export default function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [error, setError] = useState<UiError | null>(null);
   const [busy, setBusy] = useState(false);
+  // Completed work is history, not a to-do list; it is opt-in.
+  const [showDone, setShowDone] = useState(false);
 
-  const tasks = sortTasks(snapshot?.tasks ?? []);
+  const allTasks = snapshot?.tasks ?? [];
+  const doneCount = allTasks.filter((t) => t.status === 'Done').length;
+  const tasks = sortTasks(showDone ? allTasks : allTasks.filter((t) => t.status !== 'Done'));
   const pager = usePagination(tasks);
 
   const load = useCallback(async (refresh: boolean) => {
@@ -142,10 +147,29 @@ export default function App() {
           OMSN
         </span>
         <span className="titlebar__count" data-tauri-drag-region>
-          {viewer ? `${tasks.length} task${tasks.length === 1 ? '' : 's'}` : ''}
+          {viewer ? `${tasks.length} active` : ''}
         </span>
+        {doneCount > 0 && (
+          <button
+            className={`titlebar__btn ${showDone ? 'titlebar__btn--on' : ''}`}
+            onClick={() => {
+              setShowDone((v) => !v);
+              pager.reset();
+            }}
+            title={showDone ? 'Hide completed' : `Show ${doneCount} completed`}
+          >
+            ✓
+          </button>
+        )}
         <button className="titlebar__btn" onClick={() => void load(true)} title="Refresh">
           ↻
+        </button>
+        <button
+          className="titlebar__btn titlebar__btn--close"
+          onClick={() => void getCurrentWindow().hide()}
+          title="Hide (⌘Q to quit)"
+        >
+          ×
         </button>
       </header>
 

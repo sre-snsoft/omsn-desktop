@@ -52,8 +52,8 @@ body {
 .titlebar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 10px 8px 76px; /* leave room for the macOS traffic lights */
+  gap: 6px;
+  padding: 7px 8px 7px 12px; /* no native traffic lights to avoid */
   border-bottom: 1px solid var(--line);
   background: var(--bg-raised);
   user-select: none;
@@ -84,6 +84,17 @@ body {
 .titlebar__btn:hover {
   color: var(--text);
   background: var(--line);
+}
+
+/* Completed-tasks filter, lit when active. */
+.titlebar__btn--on {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.titlebar__btn--close:hover {
+  color: #fff;
+  background: var(--danger);
 }
 
 /* ── Notices ─────────────────────────────────────────────────────── */
