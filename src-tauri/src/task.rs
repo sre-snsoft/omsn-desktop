@@ -62,6 +62,23 @@ pub struct Person {
     pub name: String,
 }
 
+/// The signed-in user.
+///
+/// A struct rather than loose `&str` arguments: `is_owned_by` is the app's
+/// only access gate, and two interchangeable strings could be passed in the
+/// wrong order at a call site without the compiler noticing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Viewer {
+    pub open_id: String,
+    pub display_name: String,
+}
+
+impl Viewer {
+    pub fn new(open_id: impl Into<String>, display_name: impl Into<String>) -> Self {
+        Viewer { open_id: open_id.into(), display_name: display_name.into() }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub record_id: String,
@@ -149,14 +166,14 @@ impl Task {
 
     /// True when this task belongs to the given person.
     ///
-    /// Matching is by id first. `open_id` is app-scoped in Lark — the same
-    /// human has a different id per app — so a name match is kept as a
-    /// fallback for records written by the OMSN plugin under its own app.
-    pub fn is_owned_by(&self, user_id: &str, user_name: &str) -> bool {
-        self.owners.iter().any(|p| {
-            (!p.id.is_empty() && p.id == user_id)
-                || (!p.name.is_empty() && !user_name.is_empty() && p.name == user_name)
-        })
+    /// Matched on `open_id` only. `open_id` is app-scoped, but Lark resolves
+    /// person fields into the *requesting* app's scope — verified against the
+    /// live Base: records written by the OMSN plugin come back carrying this
+    /// app's id for the same human. Display names are deliberately not used;
+    /// they are mutable, can collide, and this is the app's only access gate.
+    pub fn is_owned_by(&self, viewer: &Viewer) -> bool {
+        !viewer.open_id.is_empty()
+            && self.owners.iter().any(|p| !p.id.is_empty() && p.id == viewer.open_id)
     }
 
     pub fn is_unassigned(&self) -> bool {
@@ -195,9 +212,11 @@ impl Task {
 /// Keep only the signed-in user's tasks.
 ///
 /// This is the single place the personal-first rule is applied, so there is
-/// one obvious thing to change if the app ever grows a team view.
-pub fn only_mine(tasks: Vec<Task>, user_id: &str, user_name: &str) -> Vec<Task> {
-    tasks.into_iter().filter(|t| t.is_owned_by(user_id, user_name)).collect()
+/// one obvious thing to change if the app ever grows a team view. It must stay
+/// in the Rust core: filtering in the UI would mean the whole team's tasks
+/// have already crossed the bridge into the webview.
+pub fn only_mine(tasks: Vec<Task>, viewer: &Viewer) -> Vec<Task> {
+    tasks.into_iter().filter(|t| t.is_owned_by(viewer)).collect()
 }
 
 #[cfg(test)]
@@ -244,19 +263,29 @@ mod tests {
     }
 
     #[test]
-    fn matches_owner_by_id_and_by_name() {
+    fn matches_owner_by_id_only() {
         let f = fields_of(json!({"Owner": [{"id": "ou_me", "name": "Adrian Chong"}]}));
         let t = Task::from_record("r".into(), &f);
-        assert!(t.is_owned_by("ou_me", "someone else"), "id should match");
-        assert!(t.is_owned_by("ou_different", "Adrian Chong"), "name is the fallback");
-        assert!(!t.is_owned_by("ou_other", "Wei Siong"));
+        assert!(t.is_owned_by(&Viewer::new("ou_me", "anything")));
+        assert!(!t.is_owned_by(&Viewer::new("ou_other", "Wei Siong")));
+    }
+
+    #[test]
+    fn a_shared_display_name_does_not_leak_tasks() {
+        // Two people can legitimately share a display name; only the id decides.
+        let f = fields_of(json!({"Owner": [{"id": "ou_them", "name": "Adrian Chong"}]}));
+        let t = Task::from_record("r".into(), &f);
+        assert!(
+            !t.is_owned_by(&Viewer::new("ou_me", "Adrian Chong")),
+            "same name, different person — must not match"
+        );
     }
 
     #[test]
     fn empty_identity_never_matches_everything() {
         let f = fields_of(json!({"Owner": [{"id": "", "name": ""}]}));
         let t = Task::from_record("r".into(), &f);
-        assert!(!t.is_owned_by("", ""), "blank identity must not own blank owners");
+        assert!(!t.is_owned_by(&Viewer::new("", "")), "blank identity must match nothing");
     }
 
     #[test]
@@ -265,8 +294,8 @@ mod tests {
             "Owner": [{"id": "ou_a", "name": "Bo Wei"}, {"id": "ou_b", "name": "Kai Xuan"}]
         }));
         let t = Task::from_record("r".into(), &f);
-        assert!(t.is_owned_by("ou_a", ""));
-        assert!(t.is_owned_by("ou_b", ""));
+        assert!(t.is_owned_by(&Viewer::new("ou_a", "")));
+        assert!(t.is_owned_by(&Viewer::new("ou_b", "")));
     }
 
     #[test]
@@ -279,7 +308,7 @@ mod tests {
         })));
         let orphan = Task::from_record("3".into(), &fields_of(json!({"Title": "orphan"})));
 
-        let got = only_mine(vec![mine, theirs, orphan], "ou_me", "Me");
+        let got = only_mine(vec![mine, theirs, orphan], &Viewer::new("ou_me", "Me"));
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].title, "mine");
     }
