@@ -12,11 +12,17 @@
   "app": {
     "windows": [
       {
-        "title": "OMSN \u2014 My Tasks",
-        "width": 1100,
-        "height": 760,
-        "minWidth": 720,
-        "minHeight": 480
+        "title": "OMSN",
+        "width": 400,
+        "height": 620,
+        "minWidth": 300,
+        "minHeight": 320,
+        "resizable": true,
+        "alwaysOnTop": true,
+        "decorations": false,
+        "transparent": false,
+        "shadow": true,
+        "center": false
       }
     ],
     "security": {
