@@ -19,10 +19,11 @@
         "minHeight": 320,
         "resizable": true,
         "alwaysOnTop": true,
-        "decorations": false,
+        "decorations": true,
         "transparent": false,
         "shadow": true,
-        "center": false
+        "center": false,
+        "titleBarStyle": "Overlay"
       }
     ],
     "security": {

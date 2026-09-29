@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { getCurrentWindow } from '@tauri-apps/api/window';
 import type { Snapshot, Task, UiError, Viewer } from './types';
 import { STATUS_ICON, daysSince, isStale, sortTasks } from './types';
 import { usePagination } from './usePagination';
@@ -15,7 +14,6 @@ const NEXT_STATUS: Record<string, string> = {
   'This Week': 'In Progress',
   'In Progress': 'Done',
   'On Hold': 'In Progress',
-  Done: 'Backlog',
 };
 
 function relativeTime(millis: number): string {
@@ -74,12 +72,12 @@ export default function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [error, setError] = useState<UiError | null>(null);
   const [busy, setBusy] = useState(false);
-  // Completed work is history, not a to-do list; it is opt-in.
-  const [showDone, setShowDone] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
 
-  const allTasks = snapshot?.tasks ?? [];
-  const doneCount = allTasks.filter((t) => t.status === 'Done').length;
-  const tasks = sortTasks(showDone ? allTasks : allTasks.filter((t) => t.status !== 'Done'));
+  // Completed work is history, not a to-do list — it never appears here.
+  // On Hold does: it is blocked, not finished, and hiding it would let it rot
+  // unseen, which is exactly what the weekly "still blocked?" nudge exists for.
+  const tasks = sortTasks((snapshot?.tasks ?? []).filter((t) => t.status !== 'Done'));
   const pager = usePagination(tasks);
 
   const load = useCallback(async (refresh: boolean) => {
@@ -132,10 +130,19 @@ export default function App() {
         patch: { status },
       });
       setSnapshot(snap);
+      // A completed task leaves the list, so say so — otherwise it just
+      // disappears and the click looks like it did something unintended.
+      setToast(status === 'Done' ? `Completed “${task.title}”` : `Moved to ${status}`);
     } catch (err) {
       setError(err as UiError);
     }
   };
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 2600);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
 
   const pendingIds = new Set(snapshot?.pending_ids ?? []);
 
@@ -149,27 +156,8 @@ export default function App() {
         <span className="titlebar__count" data-tauri-drag-region>
           {viewer ? `${tasks.length} active` : ''}
         </span>
-        {doneCount > 0 && (
-          <button
-            className={`titlebar__btn ${showDone ? 'titlebar__btn--on' : ''}`}
-            onClick={() => {
-              setShowDone((v) => !v);
-              pager.reset();
-            }}
-            title={showDone ? 'Hide completed' : `Show ${doneCount} completed`}
-          >
-            ✓
-          </button>
-        )}
         <button className="titlebar__btn" onClick={() => void load(true)} title="Refresh">
           ↻
-        </button>
-        <button
-          className="titlebar__btn titlebar__btn--close"
-          onClick={() => void getCurrentWindow().hide()}
-          title="Hide (⌘Q to quit)"
-        >
-          ×
         </button>
       </header>
 
@@ -212,6 +200,8 @@ export default function App() {
           ))}
         </ul>
       </main>
+
+      {toast && <div className="toast">{toast}</div>}
 
       <footer className="pager">
         <button onClick={pager.prev} disabled={!pager.hasPrev} title="Previous page">
