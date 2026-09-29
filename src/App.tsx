@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { Snapshot, Task, UiError, Viewer } from './types';
-import { STATUS_ICON, daysSince, isStale, sortTasks } from './types';
+import { STATUS_CLASS, STATUS_ICON, daysSince, isStale, sortTasks } from './types';
 import { usePagination } from './usePagination';
 import './App.css';
 
@@ -39,11 +39,11 @@ function TaskRow({
   return (
     <li className={`task ${pending ? 'task--pending' : ''}`}>
       <button
-        className="task__status"
+        className={`task__status task__status--${STATUS_CLASS[task.status] ?? 'backlog'}`}
         title={`${task.status} → ${NEXT_STATUS[task.status] ?? 'Backlog'}`}
         onClick={() => onAdvance(task)}
       >
-        {STATUS_ICON[task.status] ?? '•'}
+        {STATUS_ICON[task.status] ?? '○'}
       </button>
       <div className="task__body">
         <span className="task__title" title={task.title}>

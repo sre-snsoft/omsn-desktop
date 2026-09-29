@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "OMSN",
+        "title": "",
         "width": 400,
         "height": 620,
         "minWidth": 300,

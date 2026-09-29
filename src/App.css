@@ -161,11 +161,22 @@ body {
   background: none;
   border: none;
   cursor: pointer;
-  font-size: 13px;
+  font-size: 15px;
   padding: 0;
-  line-height: 1.4;
+  line-height: 1.25;
   flex: 0 0 auto;
+  transition: transform 90ms ease-out;
 }
+
+.task__status:hover {
+  transform: scale(1.22);
+}
+
+.task__status--backlog  { color: var(--muted); }
+.task__status--week     { color: #a98bff; }
+.task__status--progress { color: var(--accent); }
+.task__status--hold     { color: var(--warn); }
+.task__status--done     { color: #4cc38a; }
 
 .task__body {
   display: flex;

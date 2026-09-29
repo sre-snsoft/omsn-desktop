@@ -49,12 +49,24 @@ export interface TaskPatch {
 /** Status values as stored in the Base, in the order they matter at standup. */
 export const STATUS_ORDER = ['In Progress', 'This Week', 'On Hold', 'Backlog', 'Done'] as const;
 
+/** Progression markers: empty → half → full → check.
+ *  Geometric glyphs read as one family at small sizes, which mixed-weight
+ *  emoji do not. Colour carries the state; the shape carries the progress. */
 export const STATUS_ICON: Record<string, string> = {
-  'In Progress': '🔵',
-  'This Week': '🟣',
-  'On Hold': '⏸️',
-  Backlog: '📋',
-  Done: '✅',
+  Backlog: '○',
+  'This Week': '◔',
+  'In Progress': '◐',
+  'On Hold': '◑',
+  Done: '●',
+};
+
+/** CSS modifier per status, so colour is styled rather than baked in. */
+export const STATUS_CLASS: Record<string, string> = {
+  Backlog: 'backlog',
+  'This Week': 'week',
+  'In Progress': 'progress',
+  'On Hold': 'hold',
+  Done: 'done',
 };
 
 /** An In Progress task untouched for this long needs a decision. */

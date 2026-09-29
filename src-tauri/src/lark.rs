@@ -7,10 +7,14 @@
 //! with a non-zero `code` for most failures: checking the status alone
 //! reports failures as success.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
 
+use crate::auth::{self, TokenSet};
+use crate::config::AppConfig;
 use crate::error::{CoreError, Result};
 use crate::repo::{TaskPatch, TaskRepository};
 use crate::task::{Task, Viewer};
@@ -25,9 +29,11 @@ const MAX_PAGES: usize = 20;
 
 pub struct BitableRepo {
     http: reqwest::Client,
-    base_token: String,
-    table_id: String,
-    access_token: String,
+    cfg: AppConfig,
+    /// Guarded so that concurrent 401s produce one refresh, not several.
+    /// Lark rotates the refresh token, so a second exchange would invalidate
+    /// the first and log the user out at random.
+    tokens: Arc<Mutex<TokenSet>>,
 }
 
 /// Unwrap the `{code, msg, data}` envelope every Lark endpoint returns.
@@ -41,19 +47,61 @@ fn envelope(body: Value) -> Result<Value> {
 }
 
 impl BitableRepo {
-    pub fn new(base_token: String, table_id: String, access_token: String) -> Result<Self> {
+    pub fn new(cfg: AppConfig, tokens: TokenSet) -> Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(CoreError::Network)?;
-        Ok(BitableRepo { http, base_token, table_id, access_token })
+        Ok(BitableRepo { http, cfg, tokens: Arc::new(Mutex::new(tokens)) })
+    }
+
+    fn now_secs() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    /// A valid access token, refreshing first if the current one is spent.
+    async fn access_token(&self) -> Result<String> {
+        let mut guard = self.tokens.lock().await;
+        if guard.is_usable(Self::now_secs()) {
+            return Ok(guard.access_token.clone());
+        }
+        if !guard.can_refresh() {
+            return Err(CoreError::Unauthorized);
+        }
+        let refreshed = auth::refresh(
+            &self.http,
+            &self.cfg.app_id,
+            &self.cfg.app_secret,
+            &guard.refresh_token,
+            Self::now_secs(),
+        )
+        .await?;
+        auth::save_tokens(&refreshed)?;
+        *guard = refreshed;
+        Ok(guard.access_token.clone())
+    }
+
+    /// Force a refresh after the server rejected a token we believed valid.
+    async fn force_refresh(&self) -> Result<String> {
+        let mut guard = self.tokens.lock().await;
+        let refreshed = auth::refresh(
+            &self.http,
+            &self.cfg.app_id,
+            &self.cfg.app_secret,
+            &guard.refresh_token,
+            Self::now_secs(),
+        )
+        .await?;
+        auth::save_tokens(&refreshed)?;
+        *guard = refreshed;
+        Ok(guard.access_token.clone())
     }
 
     fn records_url(&self, record_id: Option<&str>) -> String {
         let base = format!(
             "{API_BASE}/open-apis/bitable/v1/apps/{}/tables/{}/records",
-            self.base_token, self.table_id
+            self.cfg.base_token, self.cfg.table_id
         );
         match record_id {
             Some(id) => format!("{base}/{id}"),
@@ -61,16 +109,39 @@ impl BitableRepo {
         }
     }
 
+    /// Send with a valid token, refreshing and retrying **once** if the server
+    /// still says the session is dead. Call sites never handle tokens.
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<Value> {
-        let resp = req.bearer_auth(&self.access_token).send().await?;
-        // Map transport-level auth failures before trying to read an envelope.
+        let token = self.access_token().await?;
+        let first = Self::attempt(req.try_clone(), &token).await;
+
+        match first {
+            Err(CoreError::Unauthorized) => {
+                let token = self.force_refresh().await?;
+                Self::attempt(req.try_clone(), &token)
+                    .await
+                    .and_then(|v| v.ok_or(CoreError::Unauthorized))
+            }
+            other => other.and_then(|v| v.ok_or(CoreError::Unauthorized)),
+        }
+    }
+
+    /// `None` signals the request could not be cloned for a retry.
+    async fn attempt(
+        req: Option<reqwest::RequestBuilder>,
+        token: &str,
+    ) -> Result<Option<Value>> {
+        let Some(req) = req else {
+            return Err(CoreError::Config("request could not be retried".into()));
+        };
+        let resp = req.bearer_auth(token).send().await?;
         match resp.status().as_u16() {
             401 => return Err(CoreError::Unauthorized),
             403 => return Err(CoreError::Forbidden),
             429 => return Err(CoreError::RateLimited),
             _ => {}
         }
-        envelope(resp.json::<Value>().await?)
+        envelope(resp.json::<Value>().await?).map(Some)
     }
 
     /// Identify the signed-in user, so ownership can be matched by open_id.
@@ -164,7 +235,18 @@ mod tests {
     use super::*;
 
     fn repo() -> BitableRepo {
-        BitableRepo::new("bas123".into(), "tbl456".into(), "tok".into()).unwrap()
+        let cfg = AppConfig {
+            base_token: "bas123".into(),
+            table_id: "tbl456".into(),
+            app_id: "cli_test".into(),
+            app_secret: "secret".into(),
+        };
+        let tokens = TokenSet {
+            access_token: "tok".into(),
+            refresh_token: "ref".into(),
+            expires_at: i64::MAX,
+        };
+        BitableRepo::new(cfg, tokens).unwrap()
     }
 
     #[test]

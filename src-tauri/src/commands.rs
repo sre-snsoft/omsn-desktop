@@ -9,7 +9,8 @@ use chrono::Utc;
 use tauri::State;
 use tokio::sync::RwLock;
 
-use crate::config::{cached_access_token, AppConfig};
+use crate::auth;
+use crate::config::AppConfig;
 use crate::error::{Result, UiError};
 use crate::lark::BitableRepo;
 use crate::repo::TaskPatch;
@@ -35,8 +36,9 @@ fn now_millis() -> i64 {
 /// again after a sign-in.
 async fn connect() -> Result<(Store<BitableRepo>, Viewer)> {
     let cfg = AppConfig::load()?;
-    let token = cached_access_token()?;
-    let repo = BitableRepo::new(cfg.base_token, cfg.table_id, token)?;
+    // whoami goes through the same refreshing transport, so an expired
+    // session heals here instead of dead-ending at the sign-in prompt.
+    let repo = BitableRepo::new(cfg, auth::load_tokens()?)?;
     let viewer = repo.whoami().await?;
     Ok((Store::new(repo), viewer))
 }

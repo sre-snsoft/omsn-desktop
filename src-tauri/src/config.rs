@@ -20,6 +20,9 @@ pub fn config_dir() -> PathBuf {
 pub struct AppConfig {
     pub base_token: String,
     pub table_id: String,
+    /// Needed to refresh an expired session without a browser round trip.
+    pub app_id: String,
+    pub app_secret: String,
 }
 
 /// Parse `KEY=VALUE` lines, tolerating comments, blanks, `export ` and quotes.
@@ -59,31 +62,13 @@ impl AppConfig {
                 .ok_or_else(|| CoreError::Config(format!("{key} is not set in {ENV_FILE}")))
         };
 
-        Ok(AppConfig { base_token: need("OMSN_BASE_TOKEN")?, table_id: need("OMSN_TABLE_ID")? })
+        Ok(AppConfig {
+            base_token: need("OMSN_BASE_TOKEN")?,
+            table_id: need("OMSN_TABLE_ID")?,
+            app_id: need("OMSN_LARK_APP_ID")?,
+            app_secret: need("OMSN_LARK_APP_SECRET")?,
+        })
     }
-}
-
-/// Read the cached access token.
-///
-/// Phase 1 reuses the token the probe obtained. Phase 2 moves the OAuth flow
-/// into the app and the token into the OS keychain; this is the seam that will
-/// be replaced, and nothing else needs to change when it is.
-pub fn cached_access_token() -> Result<String> {
-    let path = config_dir().join(TOKEN_FILE);
-    let raw = std::fs::read_to_string(&path).map_err(|_| {
-        CoreError::Auth(format!(
-            "No saved session. Run the probe once to sign in ({}).",
-            path.display()
-        ))
-    })?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| CoreError::Auth(format!("Saved session is unreadable: {e}")))?;
-    parsed
-        .get("access_token")
-        .and_then(serde_json::Value::as_str)
-        .filter(|t| !t.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| CoreError::Auth("Saved session has no access token".into()))
 }
 
 #[cfg(test)]
