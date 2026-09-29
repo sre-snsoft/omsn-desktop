@@ -1,0 +1,277 @@
+//! The task domain model.
+//!
+//! Lark Base cells are loosely typed — a single-select arrives as a bare
+//! string or a one-element array, a person field as an array of objects. All
+//! of that normalising happens here so the rest of the app sees clean data.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Field names as they exist in the team's Base. The app never invents
+/// columns; changing the schema is explicitly out of scope.
+pub mod fields {
+    pub const TITLE: &str = "Title";
+    pub const STATUS: &str = "Status";
+    pub const OWNER: &str = "Owner";
+    pub const PRIORITY: &str = "Priority";
+    pub const CATEGORY: &str = "Category";
+    pub const WORKSTREAM: &str = "Workstream";
+    pub const REMARKS: &str = "Remarks";
+    pub const DUE_DATE: &str = "Due Date";
+    pub const CREATED: &str = "Created";
+    pub const MODIFIED: &str = "Modified";
+}
+
+/// An item older than this with no movement needs a decision at standup.
+pub const STALE_DAYS: i64 = 14;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Person {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Task {
+    pub record_id: String,
+    pub title: String,
+    pub status: String,
+    pub owners: Vec<Person>,
+    pub priority: Option<String>,
+    pub category: Option<String>,
+    pub workstream: Option<String>,
+    pub remarks: Option<String>,
+    pub due_date: Option<i64>,
+    pub created: Option<i64>,
+    pub modified: Option<i64>,
+}
+
+/// Pull a scalar out of a cell that may be a string or a one-element array.
+fn scalar(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Array(items) => items.first().and_then(|v| match v {
+            Value::String(s) if !s.is_empty() => Some(s.clone()),
+            Value::Object(o) => o.get("text").and_then(Value::as_str).map(str::to_string),
+            _ => None,
+        }),
+        Value::Object(o) => o.get("text").and_then(Value::as_str).map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Lark returns dates as epoch milliseconds, sometimes as a numeric string.
+fn epoch_millis(value: Option<&Value>) -> Option<i64> {
+    match value? {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s
+            .parse::<i64>()
+            .ok()
+            .or_else(|| DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp_millis())),
+        _ => None,
+    }
+}
+
+fn people(value: Option<&Value>) -> Vec<Person> {
+    let Some(Value::Array(items)) = value else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let obj = item.as_object()?;
+            let id = obj
+                .get("id")
+                .or_else(|| obj.get("open_id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let name = obj.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+            if id.is_empty() && name.is_empty() {
+                None
+            } else {
+                Some(Person { id, name })
+            }
+        })
+        .collect()
+}
+
+impl Task {
+    /// Build a task from one Bitable record. Unknown or missing cells become
+    /// `None` rather than failing the whole fetch — one malformed row must not
+    /// blank the user's board.
+    pub fn from_record(record_id: String, f: &serde_json::Map<String, Value>) -> Self {
+        Task {
+            record_id,
+            title: scalar(f.get(fields::TITLE)).unwrap_or_else(|| "(untitled)".to_string()),
+            status: scalar(f.get(fields::STATUS)).unwrap_or_else(|| "Backlog".to_string()),
+            owners: people(f.get(fields::OWNER)),
+            priority: scalar(f.get(fields::PRIORITY)),
+            category: scalar(f.get(fields::CATEGORY)),
+            workstream: scalar(f.get(fields::WORKSTREAM)),
+            remarks: scalar(f.get(fields::REMARKS)),
+            due_date: epoch_millis(f.get(fields::DUE_DATE)),
+            created: epoch_millis(f.get(fields::CREATED)),
+            modified: epoch_millis(f.get(fields::MODIFIED)),
+        }
+    }
+
+    /// True when this task belongs to the given person.
+    ///
+    /// Matching is by id first. `open_id` is app-scoped in Lark — the same
+    /// human has a different id per app — so a name match is kept as a
+    /// fallback for records written by the OMSN plugin under its own app.
+    pub fn is_owned_by(&self, user_id: &str, user_name: &str) -> bool {
+        self.owners.iter().any(|p| {
+            (!p.id.is_empty() && p.id == user_id)
+                || (!p.name.is_empty() && !user_name.is_empty() && p.name == user_name)
+        })
+    }
+
+    pub fn is_unassigned(&self) -> bool {
+        self.owners.is_empty()
+    }
+
+    pub fn is_active(&self) -> bool {
+        matches!(self.status.as_str(), "In Progress" | "On Hold" | "Backlog")
+    }
+
+    /// Whole days since creation, using the supplied clock so tests are stable.
+    pub fn age_days(&self, now: DateTime<Utc>) -> Option<i64> {
+        let created = self.created?;
+        Some((now.timestamp_millis() - created) / 86_400_000)
+    }
+
+    /// Needs a decision: in flight, past the threshold, and nothing has moved.
+    pub fn needs_attention(&self, now: DateTime<Utc>) -> bool {
+        self.status == "In Progress" && self.age_days(now).is_some_and(|d| d >= STALE_DAYS)
+    }
+}
+
+/// Keep only the signed-in user's tasks.
+///
+/// This is the single place the personal-first rule is applied, so there is
+/// one obvious thing to change if the app ever grows a team view.
+pub fn only_mine(tasks: Vec<Task>, user_id: &str, user_name: &str) -> Vec<Task> {
+    tasks.into_iter().filter(|t| t.is_owned_by(user_id, user_name)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fields_of(v: Value) -> serde_json::Map<String, Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    }
+
+    #[test]
+    fn parses_a_typical_record() {
+        let f = fields_of(json!({
+            "Title": "Migrate PG bucket to Aliyun OSS",
+            "Status": ["In Progress"],
+            "Owner": [{"id": "ou_abc", "name": "Kai Xuan"}],
+            "Priority": "P1",
+        }));
+        let t = Task::from_record("rec1".into(), &f);
+        assert_eq!(t.title, "Migrate PG bucket to Aliyun OSS");
+        assert_eq!(t.status, "In Progress");
+        assert_eq!(t.owners.len(), 1);
+        assert_eq!(t.owners[0].name, "Kai Xuan");
+        assert_eq!(t.priority.as_deref(), Some("P1"));
+    }
+
+    #[test]
+    fn survives_a_record_with_nothing_in_it() {
+        let t = Task::from_record("rec2".into(), &fields_of(json!({})));
+        assert_eq!(t.title, "(untitled)");
+        assert_eq!(t.status, "Backlog");
+        assert!(t.owners.is_empty());
+    }
+
+    #[test]
+    fn handles_cjk_titles() {
+        let f = fields_of(json!({"Title": "优化搭建新站点自动化", "Status": "In Progress"}));
+        assert_eq!(Task::from_record("r".into(), &f).title, "优化搭建新站点自动化");
+    }
+
+    #[test]
+    fn matches_owner_by_id_and_by_name() {
+        let f = fields_of(json!({"Owner": [{"id": "ou_me", "name": "Adrian Chong"}]}));
+        let t = Task::from_record("r".into(), &f);
+        assert!(t.is_owned_by("ou_me", "someone else"), "id should match");
+        assert!(t.is_owned_by("ou_different", "Adrian Chong"), "name is the fallback");
+        assert!(!t.is_owned_by("ou_other", "Wei Siong"));
+    }
+
+    #[test]
+    fn empty_identity_never_matches_everything() {
+        let f = fields_of(json!({"Owner": [{"id": "", "name": ""}]}));
+        let t = Task::from_record("r".into(), &f);
+        assert!(!t.is_owned_by("", ""), "blank identity must not own blank owners");
+    }
+
+    #[test]
+    fn multi_owner_task_belongs_to_each_owner() {
+        let f = fields_of(json!({
+            "Owner": [{"id": "ou_a", "name": "Bo Wei"}, {"id": "ou_b", "name": "Kai Xuan"}]
+        }));
+        let t = Task::from_record("r".into(), &f);
+        assert!(t.is_owned_by("ou_a", ""));
+        assert!(t.is_owned_by("ou_b", ""));
+    }
+
+    #[test]
+    fn only_mine_excludes_unassigned_and_others() {
+        let mine = Task::from_record("1".into(), &fields_of(json!({
+            "Title": "mine", "Owner": [{"id": "ou_me", "name": "Me"}]
+        })));
+        let theirs = Task::from_record("2".into(), &fields_of(json!({
+            "Title": "theirs", "Owner": [{"id": "ou_you", "name": "You"}]
+        })));
+        let orphan = Task::from_record("3".into(), &fields_of(json!({"Title": "orphan"})));
+
+        let got = only_mine(vec![mine, theirs, orphan], "ou_me", "Me");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].title, "mine");
+    }
+
+    #[test]
+    fn stale_in_progress_needs_attention() {
+        let old = now().timestamp_millis() - 20 * 86_400_000;
+        let f = fields_of(json!({"Status": "In Progress", "Created": old}));
+        assert!(Task::from_record("r".into(), &f).needs_attention(now()));
+    }
+
+    #[test]
+    fn fresh_work_is_left_alone() {
+        let recent = now().timestamp_millis() - 3 * 86_400_000;
+        let f = fields_of(json!({"Status": "In Progress", "Created": recent}));
+        assert!(!Task::from_record("r".into(), &f).needs_attention(now()));
+    }
+
+    #[test]
+    fn old_backlog_is_not_flagged() {
+        let old = now().timestamp_millis() - 200 * 86_400_000;
+        let f = fields_of(json!({"Status": "Backlog", "Created": old}));
+        assert!(
+            !Task::from_record("r".into(), &f).needs_attention(now()),
+            "backlog is unscheduled, not rotting"
+        );
+    }
+
+    #[test]
+    fn accepts_dates_as_string_or_number() {
+        let a = fields_of(json!({"Created": 1_700_000_000_000i64}));
+        let b = fields_of(json!({"Created": "1700000000000"}));
+        assert_eq!(
+            Task::from_record("a".into(), &a).created,
+            Task::from_record("b".into(), &b).created
+        );
+    }
+}
