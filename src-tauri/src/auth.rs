@@ -187,4 +187,86 @@ mod tests {
         let err = TokenSet::from_response(&body, 0).unwrap_err().to_string();
         assert!(!err.contains("SECRET-VALUE"), "error must not echo the body");
     }
+
+    // ---- Regression tests for the "Sign in does nothing" report ----
+
+    /// The Phase 0 probe writes Lark's RAW token response to the same cache
+    /// file. That body reports a *relative* lifetime (`expires_in`), so the
+    /// absolute `expires_at` the Rust side needs is simply absent.
+    #[test]
+    fn a_probe_written_cache_deserialises_with_no_expiry_at_all() {
+        let probe_body = r#"{
+            "code": 0,
+            "msg": "success",
+            "access_token": "u-brand-new-token",
+            "refresh_token": "ur-brand-new-refresh",
+            "expires_in": 7200,
+            "refresh_token_expires_in": 2592000,
+            "token_type": "Bearer",
+            "scope": "bitable:app contact:user.base:readonly offline_access"
+        }"#;
+        let t: TokenSet = serde_json::from_str(probe_body).unwrap();
+        assert_eq!(t.access_token, "u-brand-new-token");
+        // The lifetime is silently dropped on the floor.
+        assert_eq!(t.expires_at, 0, "expires_in is not read; expires_at defaults to 0");
+    }
+
+    /// Consequence of the above: a token minted one second ago is classed as
+    /// long expired, so every start forces a refresh round trip.
+    #[test]
+    fn a_probe_written_cache_is_never_usable_however_fresh() {
+        let t: TokenSet = serde_json::from_str(
+            r#"{"access_token": "fresh", "refresh_token": "r", "expires_in": 7200}"#,
+        )
+        .unwrap();
+        let now = 1_790_000_000;
+        assert!(!t.is_usable(now), "a valid token is treated as expired");
+        assert!(t.can_refresh(), "recovery depends entirely on the refresh token");
+    }
+
+    /// The same cache with no `offline_access` grant has nothing to fall back
+    /// on: not usable and not refreshable. This is the dead end.
+    #[test]
+    fn a_probe_cache_without_a_refresh_token_is_a_dead_end() {
+        let t: TokenSet = serde_json::from_str(
+            r#"{"access_token": "fresh", "expires_in": 7200}"#,
+        )
+        .unwrap();
+        assert!(!t.is_usable(1_790_000_000));
+        assert!(!t.can_refresh(), "no way back: access_token() can only return Unauthorized");
+    }
+
+    /// Some Lark responses nest the payload under `data`. `access_token` has
+    /// no serde default, so that shape does not deserialise at all.
+    #[test]
+    fn a_cache_nested_under_data_fails_to_load_entirely() {
+        let nested = r#"{"code": 0, "data": {"access_token": "a", "expires_in": 7200}}"#;
+        let parsed: std::result::Result<TokenSet, _> = serde_json::from_str(nested);
+        assert!(parsed.is_err(), "nested caches are unreadable, not merely expired");
+    }
+
+    /// `from_response` does the conversion correctly — proving the bug is the
+    /// cache *format*, not the parser, and that a successful refresh heals it.
+    #[test]
+    fn a_successful_refresh_rewrites_the_cache_into_the_absolute_form() {
+        let body = serde_json::from_str::<Value>(
+            r#"{"code": 0, "access_token": "a", "refresh_token": "r", "expires_in": 7200}"#,
+        )
+        .unwrap();
+        let healed = TokenSet::from_response(&body, 1_790_000_000).unwrap();
+        assert_eq!(healed.expires_at, 1_790_007_200);
+        assert!(healed.is_usable(1_790_000_000));
+        // And save_tokens serialises only the three fields the Rust side reads.
+        let written = serde_json::to_string(&healed).unwrap();
+        assert!(written.contains("expires_at"));
+        assert!(!written.contains("expires_in"), "the relative form must not survive a save");
+    }
+
+    /// A refresh attempt with nothing to refresh must not hit the network.
+    #[tokio::test]
+    async fn refresh_with_an_empty_token_fails_locally() {
+        let http = reqwest::Client::new();
+        let err = refresh(&http, "id", "secret", "", 0).await.unwrap_err();
+        assert!(matches!(err, CoreError::Auth(_)));
+    }
 }

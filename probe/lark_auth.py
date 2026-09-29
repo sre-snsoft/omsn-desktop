@@ -10,6 +10,8 @@ import json
 import os
 import secrets
 import ssl
+import sys
+import time
 import threading
 import urllib.parse
 import urllib.request
@@ -48,6 +50,23 @@ class ConfigError(RuntimeError):
     """Raised when required credentials are missing or malformed."""
 
 
+def normalise_tokens(tokens: dict, now_secs: float | None = None) -> dict:
+    """Reduce a raw Lark token response to the shape the app reads.
+
+    Lark reports a *relative* lifetime (`expires_in`); the app needs an
+    absolute `expires_at`. Writing the raw body made every launch treat a
+    brand-new token as long expired, spending a refresh — and each refresh
+    rotates the refresh token, so the cost was not merely a wasted round trip.
+    """
+    now = time.time() if now_secs is None else now_secs
+    data = tokens.get("data") if isinstance(tokens.get("data"), dict) else tokens
+    return {
+        "access_token": data.get("access_token", ""),
+        "refresh_token": data.get("refresh_token", ""),
+        "expires_at": int(now) + int(data.get("expires_in", 7200)),
+    }
+
+
 def save_tokens(tokens: dict, path: str = TOKEN_CACHE) -> None:
     """Persist tokens for reuse, readable only by the current user.
 
@@ -63,7 +82,7 @@ def save_tokens(tokens: dict, path: str = TOKEN_CACHE) -> None:
     tmp = f"{path}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(tokens, fh)
+        json.dump(normalise_tokens(tokens), fh)
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 

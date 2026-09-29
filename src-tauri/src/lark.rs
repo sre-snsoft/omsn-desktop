@@ -47,13 +47,16 @@ fn envelope(body: Value) -> Result<Value> {
 }
 
 impl BitableRepo {
-    pub fn new(cfg: AppConfig, tokens: TokenSet) -> Result<Self> {
+    /// The token lock is passed in, never created here: `connect()` builds a
+    /// new repo on every sign-in, so a per-repo lock would not serialise
+    /// anything across them.
+    pub fn new(cfg: AppConfig, tokens: Arc<Mutex<TokenSet>>) -> Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(CoreError::Network)?;
-        Ok(BitableRepo { http, cfg, tokens: Arc::new(Mutex::new(tokens)) })
+        Ok(BitableRepo { http, cfg, tokens })
     }
 
     fn now_secs() -> i64 {
@@ -82,9 +85,20 @@ impl BitableRepo {
         Ok(guard.access_token.clone())
     }
 
-    /// Force a refresh after the server rejected a token we believed valid.
-    async fn force_refresh(&self) -> Result<String> {
+    /// Refresh after the server rejected a token we believed valid.
+    ///
+    /// Takes the token that failed: while this call waited for the lock,
+    /// another caller may have refreshed already. Exchanging again would burn
+    /// a second rotation and invalidate the first, which is the random-logout
+    /// failure this lock exists to prevent.
+    async fn force_refresh(&self, failed_with: &str) -> Result<String> {
         let mut guard = self.tokens.lock().await;
+        if guard.access_token != failed_with && !guard.access_token.is_empty() {
+            return Ok(guard.access_token.clone());
+        }
+        if !guard.can_refresh() {
+            return Err(CoreError::Unauthorized);
+        }
         let refreshed = auth::refresh(
             &self.http,
             &self.cfg.app_id,
@@ -117,20 +131,14 @@ impl BitableRepo {
 
         match first {
             Err(CoreError::Unauthorized) => {
-                let token = self.force_refresh().await?;
-                Self::attempt(req.try_clone(), &token)
-                    .await
-                    .and_then(|v| v.ok_or(CoreError::Unauthorized))
+                let token = self.force_refresh(&token).await?;
+                Self::attempt(req.try_clone(), &token).await
             }
-            other => other.and_then(|v| v.ok_or(CoreError::Unauthorized)),
+            other => other,
         }
     }
 
-    /// `None` signals the request could not be cloned for a retry.
-    async fn attempt(
-        req: Option<reqwest::RequestBuilder>,
-        token: &str,
-    ) -> Result<Option<Value>> {
+    async fn attempt(req: Option<reqwest::RequestBuilder>, token: &str) -> Result<Value> {
         let Some(req) = req else {
             return Err(CoreError::Config("request could not be retried".into()));
         };
@@ -141,7 +149,7 @@ impl BitableRepo {
             429 => return Err(CoreError::RateLimited),
             _ => {}
         }
-        envelope(resp.json::<Value>().await?).map(Some)
+        envelope(resp.json::<Value>().await?)
     }
 
     /// Identify the signed-in user, so ownership can be matched by open_id.
@@ -246,7 +254,7 @@ mod tests {
             refresh_token: "ref".into(),
             expires_at: i64::MAX,
         };
-        BitableRepo::new(cfg, tokens).unwrap()
+        BitableRepo::new(cfg, Arc::new(Mutex::new(tokens))).unwrap()
     }
 
     #[test]
@@ -290,5 +298,96 @@ mod tests {
         let ok = json!({"record_id": "rec1", "fields": {"Title": "x"}});
         assert_eq!(parse_record(&ok).unwrap().title, "x");
         assert!(parse_record(&json!({"fields": {"Title": "x"}})).is_none());
+    }
+
+    // ---- Regression tests for the "Sign in does nothing" report ----
+
+    fn repo_with(tokens: TokenSet) -> BitableRepo {
+        let cfg = AppConfig {
+            base_token: "bas123".into(),
+            table_id: "tbl456".into(),
+            app_id: "cli_test".into(),
+            app_secret: "secret".into(),
+        };
+        BitableRepo::new(cfg, Arc::new(Mutex::new(tokens))).unwrap()
+    }
+
+    /// The dead end. No usable access token and no refresh token, so
+    /// `access_token()` returns Unauthorized without ever touching the
+    /// network — and nothing the user can do inside the app changes that.
+    #[tokio::test]
+    async fn access_token_dead_ends_when_the_cache_cannot_refresh() {
+        let repo = repo_with(TokenSet {
+            access_token: "stale".into(),
+            refresh_token: String::new(),
+            expires_at: 0,
+        });
+        let err = repo.access_token().await.unwrap_err();
+        assert!(matches!(err, CoreError::Unauthorized), "got {err:?}");
+    }
+
+    /// Pressing Sign in re-runs exactly the same code, so the user is shown a
+    /// byte-identical notice every time. Nothing on screen changes.
+    #[tokio::test]
+    async fn every_sign_in_attempt_produces_an_identical_notice() {
+        let tokens = TokenSet {
+            access_token: "stale".into(),
+            refresh_token: String::new(),
+            expires_at: 0,
+        };
+        let first: crate::error::UiError =
+            repo_with(tokens.clone()).access_token().await.unwrap_err().into();
+        let second: crate::error::UiError =
+            repo_with(tokens).access_token().await.unwrap_err().into();
+
+        assert_eq!(first.message, second.message);
+        assert_eq!(first.kind, second.kind);
+        assert_eq!(first.message, "Your session expired. Please sign in again.");
+        assert!(first.needs_login, "the UI shows a Sign in button that cannot help");
+    }
+
+    /// A cache written by the Phase 0 probe (relative `expires_in`) but with
+    /// no refresh token lands in exactly that dead end, even though the
+    /// access token itself is perfectly fresh.
+    #[tokio::test]
+    async fn a_fresh_probe_token_without_offline_access_is_rejected_offline() {
+        let tokens: TokenSet = serde_json::from_str(
+            r#"{"access_token": "minted-one-second-ago", "expires_in": 7200}"#,
+        )
+        .unwrap();
+        let err = repo_with(tokens).access_token().await.unwrap_err();
+        assert!(matches!(err, CoreError::Unauthorized), "got {err:?}");
+    }
+
+    /// `send()` calls `req.try_clone()` twice on the *same* builder. The first
+    /// attempt consumes the clone, not the original, so the second clone is
+    /// still available for the retry. This pins that behaviour.
+    #[test]
+    fn a_request_builder_survives_being_cloned_twice_for_the_retry() {
+        let r = repo();
+        let req = r.http.post(r.records_url(None)).json(&json!({"fields": {"Title": "x"}}));
+        assert!(req.try_clone().is_some(), "first attempt");
+        assert!(req.try_clone().is_some(), "retry after a 401");
+    }
+
+    #[test]
+    fn a_get_request_builder_also_clones_twice() {
+        let r = repo();
+        let req = r.http.get(format!("{API_BASE}/open-apis/authen/v1/user_info"));
+        assert!(req.try_clone().is_some());
+        assert!(req.try_clone().is_some());
+    }
+
+    /// `attempt` is documented as returning `None` when the request could not
+    /// be cloned, and `send` maps that `None` onto Unauthorized. It never
+    /// does: the un-clonable case returns Err(Config) instead, so the whole
+    /// `Option` and both `ok_or(Unauthorized)` arms are unreachable.
+    #[tokio::test]
+    async fn an_uncloneable_request_is_a_config_error_never_none() {
+        let err = BitableRepo::attempt(None, "tok").await.unwrap_err();
+        assert!(
+            matches!(err, CoreError::Config(_)),
+            "the documented None path does not exist; got {err:?}"
+        );
     }
 }
