@@ -34,6 +34,17 @@ pub mod status {
     pub const IN_PROGRESS: &str = "In Progress";
     pub const ON_HOLD: &str = "On Hold";
     pub const DONE: &str = "Done";
+
+    /// Every value the Base's Status select accepts, verified against the
+    /// live field definition.
+    pub const ALL: [&str; 5] = [BACKLOG, THIS_WEEK, IN_PROGRESS, ON_HOLD, DONE];
+
+    /// Lark *adds* an unknown value as a new option rather than rejecting it,
+    /// so a typo from this app would silently pollute the shared Base's
+    /// schema for all 14 people. Validate before writing, never after.
+    pub fn is_valid(value: &str) -> bool {
+        ALL.contains(&value)
+    }
 }
 
 /// Priority values as stored in the Base — the full label, not a bare "P1".
@@ -41,6 +52,13 @@ pub mod priority {
     pub const P0: &str = "P0 - Critical";
     pub const P1: &str = "P1 - Important";
     pub const P2: &str = "P2 - Normal";
+
+    pub const ALL: [&str; 3] = [P0, P1, P2];
+
+    /// Same auto-create hazard as Status.
+    pub fn is_valid(value: &str) -> bool {
+        ALL.contains(&value)
+    }
 
     /// Sort rank, lowest first. Unknown or empty sorts last.
     pub fn rank(value: Option<&str>) -> u8 {

@@ -9,8 +9,8 @@ use std::future::Future;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::error::Result;
-use crate::task::{fields, Task};
+use crate::error::{CoreError, Result};
+use crate::task::{fields, priority, status, Task};
 
 /// A partial update: only the fields the user actually changed.
 ///
@@ -29,6 +29,36 @@ pub struct TaskPatch {
 }
 
 impl TaskPatch {
+    /// Reject values the Base does not already define.
+    ///
+    /// A single-select silently gains a new option when written an unknown
+    /// value, so an unvalidated write is a schema change to a table 14 people
+    /// share. Checked here, before anything reaches the network.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(v) = &self.status {
+            if !status::is_valid(v) {
+                return Err(CoreError::Config(format!(
+                    "\"{v}\" is not a valid status. Expected one of: {}",
+                    status::ALL.join(", ")
+                )));
+            }
+        }
+        if let Some(v) = &self.priority {
+            if !priority::is_valid(v) {
+                return Err(CoreError::Config(format!(
+                    "\"{v}\" is not a valid priority. Expected one of: {}",
+                    priority::ALL.join(", ")
+                )));
+            }
+        }
+        if let Some(t) = &self.title {
+            if t.trim().is_empty() {
+                return Err(CoreError::Config("A task needs a title.".into()));
+            }
+        }
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.title.is_none()
             && self.status.is_none()
@@ -53,7 +83,13 @@ impl TaskPatch {
             out.insert(fields::REMARKS.to_string(), Value::String(v.clone()));
         }
         if let Some(ids) = &self.owner_ids {
-            let people = ids.iter().map(|id| Value::String(id.clone())).collect();
+            // A Person cell takes objects, not bare ids. Sending ["ou_x"]
+            // fails with UserFieldConvFail (1254066), verified against the
+            // live Base.
+            let people = ids
+                .iter()
+                .map(|id| serde_json::json!({ "id": id }))
+                .collect();
             out.insert(fields::OWNER.to_string(), Value::Array(people));
         }
         out
@@ -106,7 +142,8 @@ mod tests {
     }
 
     #[test]
-    fn owner_writes_as_a_list_of_ids() {
+    fn owner_writes_as_objects_not_bare_ids() {
+        // Regression: bare id strings are rejected with UserFieldConvFail.
         let patch = TaskPatch {
             owner_ids: Some(vec!["ou_a".into(), "ou_b".into()]),
             ..Default::default()
@@ -114,7 +151,50 @@ mod tests {
         let f = patch.to_fields();
         let owners = f.get(fields::OWNER).and_then(Value::as_array).unwrap();
         assert_eq!(owners.len(), 2);
-        assert_eq!(owners[0].as_str(), Some("ou_a"));
+        assert!(owners[0].is_object(), "a Person cell takes objects, not strings");
+        assert_eq!(owners[0].get("id").and_then(Value::as_str), Some("ou_a"));
+        assert_eq!(owners[1].get("id").and_then(Value::as_str), Some("ou_b"));
+    }
+
+    #[test]
+    fn a_made_up_status_is_refused_before_it_reaches_lark() {
+        // Lark would ADD it as a new option, changing the schema for everyone.
+        let patch = TaskPatch { status: Some("Nonsense".into()), ..Default::default() };
+        let err = patch.validate().unwrap_err().to_string();
+        assert!(err.contains("not a valid status"), "got: {err}");
+    }
+
+    #[test]
+    fn every_real_status_passes_validation() {
+        for s in crate::task::status::ALL {
+            let patch = TaskPatch { status: Some(s.into()), ..Default::default() };
+            assert!(patch.validate().is_ok(), "{s} should be accepted");
+        }
+    }
+
+    #[test]
+    fn a_made_up_priority_is_refused() {
+        let patch = TaskPatch { priority: Some("P9".into()), ..Default::default() };
+        assert!(patch.validate().is_err());
+    }
+
+    #[test]
+    fn every_real_priority_passes_validation() {
+        for p in crate::task::priority::ALL {
+            let patch = TaskPatch { priority: Some(p.into()), ..Default::default() };
+            assert!(patch.validate().is_ok(), "{p} should be accepted");
+        }
+    }
+
+    #[test]
+    fn a_blank_title_is_refused() {
+        let patch = TaskPatch { title: Some("   ".into()), ..Default::default() };
+        assert!(patch.validate().is_err());
+    }
+
+    #[test]
+    fn a_patch_that_touches_nothing_validates() {
+        assert!(TaskPatch::default().validate().is_ok());
     }
 
     #[test]

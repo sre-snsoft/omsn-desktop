@@ -206,6 +206,7 @@ impl TaskRepository for BitableRepo {
         if patch.is_empty() {
             return Err(CoreError::Config("Cannot create an empty task".into()));
         }
+        patch.validate()?;
         let body = json!({ "fields": patch.to_fields() });
         let data = self.send(self.http.post(self.records_url(None)).json(&body)).await?;
         data.get("record")
@@ -220,6 +221,7 @@ impl TaskRepository for BitableRepo {
         if patch.is_empty() {
             return Err(CoreError::Config("Nothing to update".into()));
         }
+        patch.validate()?;
         let body = json!({ "fields": patch.to_fields() });
         let url = self.records_url(Some(record_id));
         let data = self.send(self.http.put(url).json(&body)).await?;
