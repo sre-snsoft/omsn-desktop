@@ -17,11 +17,14 @@ use crate::error::{Result, UiError};
 use crate::lark::BitableRepo;
 use crate::oauth;
 use crate::repo::TaskPatch;
+use crate::store_cell::{self, StoreCell, WriteGate};
 use crate::sync::{Snapshot, Store};
 use crate::task::Viewer;
 
 pub struct AppState {
-    pub store: RwLock<Option<Store<BitableRepo>>>,
+    /// `Arc` because a background write keeps using it after the command that
+    /// started it has already answered the UI.
+    pub store: Arc<StoreCell<BitableRepo>>,
     pub viewer: RwLock<Option<Viewer>>,
     /// Process-wide, so every repo instance shares one refresh lock. Lark
     /// rotates the refresh token, so two concurrent exchanges invalidate each
@@ -29,15 +32,19 @@ pub struct AppState {
     pub tokens: Arc<Mutex<TokenSet>>,
     /// Serialises sign-in itself, so those two calls cannot both connect.
     pub connecting: Mutex<()>,
+    /// Serialises outbound record writes, so two rapid clicks reach the Base
+    /// in the order they were made.
+    pub write_gate: Arc<WriteGate>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         AppState {
-            store: RwLock::new(None),
+            store: Arc::new(RwLock::new(None)),
             viewer: RwLock::new(None),
             tokens: Arc::new(Mutex::new(TokenSet::default())),
             connecting: Mutex::new(()),
+            write_gate: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -140,23 +147,18 @@ pub async fn list_my_tasks(
         .clone()
         .ok_or_else(|| UiError::from(crate::error::CoreError::Unauthorized))?;
 
-    let mut guard = state.store.write().await;
-    let store = guard
-        .as_mut()
-        .ok_or_else(|| UiError::from(crate::error::CoreError::Unauthorized))?;
-
     if refresh {
-        if let Err(err) = store.refresh(now_millis()).await {
+        if let Err(err) = store_cell::poll(&state.store, now_millis()).await {
             // With no good snapshot behind it, an empty list would read as
             // "nothing assigned to you" — the opposite of what happened.
-            let never_loaded = store.snapshot(&viewer).fetched_at_millis == 0;
+            let never_loaded = store_cell::fetched_at_millis(&state.store).await == 0;
             if never_loaded || matches!(err, crate::error::CoreError::Unauthorized) {
                 return Err(err.into());
             }
             // Otherwise keep serving the last good data, marked stale.
         }
     }
-    Ok(store.snapshot(&viewer))
+    Ok(store_cell::snapshot(&state.store, &viewer).await?)
 }
 
 #[tauri::command]
@@ -171,13 +173,26 @@ pub async fn update_task(
         .await
         .clone()
         .ok_or_else(|| UiError::from(crate::error::CoreError::Unauthorized))?;
-    let mut guard = state.store.write().await;
-    let store = guard
-        .as_mut()
-        .ok_or_else(|| UiError::from(crate::error::CoreError::Unauthorized))?;
 
-    store.update(&record_id, patch, now_millis()).await?;
-    Ok(store.snapshot(&viewer))
+    // Overlay the change and answer immediately: the PUT, a token refresh and
+    // a possible retry are tens of seconds in the worst case, and the user
+    // clicked a button. The write continues in the background and settles
+    // itself; `write_failures` in a later snapshot is how a rejection gets
+    // back to them.
+    let started =
+        store_cell::begin_write(&state.store, &viewer, &record_id, patch.clone(), now_millis())
+            .await?;
+
+    tauri::async_runtime::spawn(store_cell::finish_write(
+        state.store.clone(),
+        state.write_gate.clone(),
+        started.repo,
+        record_id,
+        patch,
+        started.seq,
+    ));
+
+    Ok(started.snapshot)
 }
 
 #[tauri::command]

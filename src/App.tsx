@@ -1,20 +1,24 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import type { Snapshot, Task, UiError, Viewer } from './types';
-import { STATUS_CLASS, STATUS_ICON, daysSince, isStale, sortTasks } from './types';
+import type { Pin, Snapshot, Task, UiError, Viewer } from './types';
+import { formatClock, initials, pinTask, sortTasks } from './types';
+import { TaskRow } from './TaskRow';
+import { useAppVersion, useNow } from './useChrome';
 import { usePagination } from './usePagination';
 import './App.css';
 
 /** How often to re-read the Base, while the window has focus. */
 const POLL_INTERVAL_MS = 20_000;
 
-/** Clicking the marker moves work forward. Completing is deliberately absent:
- *  it removes the row, so it is confirmed rather than one click away. */
-const ADVANCE: Record<string, string> = {
-  Backlog: 'In Progress',
-  'This Week': 'In Progress',
-  'On Hold': 'In Progress',
-};
+/** While a write is in flight, re-read the local snapshot this often.
+ *  `refresh: false` touches no network — it only asks Rust what it now
+ *  believes — so a confirmation or a rejection shows up in well under a
+ *  second instead of at the next 20 s poll. */
+const SETTLE_POLL_MS = 400;
+
+/** Stop chasing a write that has not settled in this long. Past that it is
+ *  the store's 60 s overlay timeout's problem, not the UI's. */
+const SETTLE_WINDOW_MS = 12_000;
 
 function relativeTime(millis: number): string {
   const mins = Math.floor((Date.now() - millis) / 60_000);
@@ -22,84 +26,6 @@ function relativeTime(millis: number): string {
   if (mins < 60) return `${mins}m ago`;
   const hours = Math.floor(mins / 60);
   return hours < 24 ? `${hours}h ago` : `${Math.floor(hours / 24)}d ago`;
-}
-
-function TaskRow({
-  task,
-  pending,
-  onSetStatus,
-  onAskDone,
-}: {
-  task: Task;
-  pending: boolean;
-  onSetStatus: (task: Task, status: string) => void;
-  onAskDone: (task: Task) => void;
-}) {
-  const age = daysSince(task.modified ?? task.created);
-  const stale = isStale(task);
-  const inProgress = task.status === 'In Progress';
-
-  return (
-    <li className={`task ${pending ? 'task--pending' : ''}`}>
-      <button
-        className={`task__status task__status--${STATUS_CLASS[task.status] ?? 'backlog'}`}
-        title={task.status}
-        onClick={() => {
-          const next = ADVANCE[task.status];
-          if (next) onSetStatus(task, next);
-        }}
-      >
-        {STATUS_ICON[task.status] ?? '○'}
-      </button>
-
-      <div className="task__body">
-        <span className="task__title" title={task.title}>
-          {task.title}
-        </span>
-        <span className="task__meta">
-          {task.priority && (
-            <span className={`chip chip--${task.priority.slice(0, 2).toLowerCase()}`}>
-              {task.priority.slice(0, 2)}
-            </span>
-          )}
-          {age !== null && (
-            <span className={stale ? 'age age--stale' : 'age'}>
-              {age}d{stale ? ' STALE' : ''}
-            </span>
-          )}
-        </span>
-      </div>
-
-      <div className="task__actions">
-        {inProgress ? (
-          <>
-            <button
-              className="pixel-btn pixel-btn--ghost"
-              title="Back to Backlog"
-              onClick={() => onSetStatus(task, 'Backlog')}
-            >
-              ←
-            </button>
-            <button
-              className="pixel-btn pixel-btn--ok"
-              title="Mark done"
-              onClick={() => onAskDone(task)}
-            >
-              ✓
-            </button>
-          </>
-        ) : (
-          <button
-            className="pixel-btn"
-            title="Start — move to In Progress"
-            onClick={() => onSetStatus(task, 'In Progress')}
-          >
-            ▶
-          </button>
-        )}
-      </div>
-    </li>
-  );
 }
 
 export default function App() {
@@ -111,10 +37,23 @@ export default function App() {
   const [draft, setDraft] = useState('');
   const [adding, setAdding] = useState(false);
   const [confirmDone, setConfirmDone] = useState<Task | null>(null);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [pin, setPin] = useState<Pin | null>(null);
+  // A rejected write is reported separately from `error`: a poll succeeding
+  // clears `error`, and that must not erase the only notice the user ever got
+  // that their change did not stick.
+  const [writeError, setWriteError] = useState<string | null>(null);
+  const [seenFailureSeq, setSeenFailureSeq] = useState(0);
+
+  const now = useNow();
+  const version = useAppVersion();
 
   // Completed work is history, not a to-do list. On Hold stays visible: it is
   // blocked, not finished, and hiding it would let it rot unseen.
-  const tasks = sortTasks((snapshot?.tasks ?? []).filter((t) => t.status !== 'Done'));
+  const tasks = pinTask(
+    sortTasks((snapshot?.tasks ?? []).filter((t) => t.status !== 'Done')),
+    pin
+  );
   const pager = usePagination(tasks);
 
   const load = useCallback(async (refresh: boolean) => {
@@ -177,6 +116,43 @@ export default function App() {
     };
   }, [viewer, load]);
 
+  // Chase a write until Rust reports it settled, so a rejection surfaces in
+  // under a second rather than whenever the next 20 s poll happens to land.
+  const settling = (snapshot?.pending_ids.length ?? 0) > 0;
+  useEffect(() => {
+    if (!settling) return;
+    const giveUpAt = Date.now() + SETTLE_WINDOW_MS;
+    const timer = window.setInterval(() => {
+      if (Date.now() > giveUpAt) {
+        window.clearInterval(timer);
+        return;
+      }
+      void load(false);
+    }, SETTLE_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [settling, load]);
+
+  // A write the Base refused. The command returned before the answer arrived,
+  // so this is the only place the user can be told — never skip it.
+  useEffect(() => {
+    const fresh = (snapshot?.write_failures ?? []).filter((f) => f.seq > seenFailureSeq);
+    if (fresh.length === 0) return;
+    const newest = fresh[fresh.length - 1];
+    setSeenFailureSeq(newest.seq);
+    setWriteError(newest.message);
+  }, [snapshot, seenFailureSeq]);
+
+  // A poll has re-read the server, so the list order it returns is the truth.
+  useEffect(() => {
+    if (pin && snapshot && snapshot.fetched_at_millis !== pin.fetchedAt) setPin(null);
+  }, [pin, snapshot]);
+
+  // Page height is predictable only if at most one row is expanded, and an
+  // expansion carried across a page change would be invisible.
+  useEffect(() => {
+    setExpandedId(null);
+  }, [pager.page]);
+
   useEffect(() => {
     if (!toast) return;
     const timer = window.setTimeout(() => setToast(null), 2600);
@@ -184,7 +160,20 @@ export default function App() {
   }, [toast]);
 
   const setStatus = async (task: Task, status: string) => {
+    setWriteError(null);
+    // Hold the row in the slot it was clicked in. Done is exempt: it leaves
+    // the active list entirely, so there is nothing to hold.
+    const index = tasks.findIndex((t) => t.record_id === task.record_id);
+    if (status !== 'Done' && index >= 0) {
+      setPin({
+        recordId: task.record_id,
+        index,
+        fetchedAt: snapshot?.fetched_at_millis ?? 0,
+      });
+    }
     try {
+      // Returns as soon as Rust has overlaid the change; the PUT continues in
+      // the background and settles itself.
       setSnapshot(
         await invoke<Snapshot>('update_task', {
           recordId: task.record_id,
@@ -193,6 +182,7 @@ export default function App() {
       );
       setToast(status === 'Done' ? `Done: ${task.title}` : `-> ${status}`);
     } catch (err) {
+      setPin(null);
       setError(err as UiError);
     }
   };
@@ -207,6 +197,7 @@ export default function App() {
         await invoke<Snapshot>('create_task', { patch: { title, status: 'In Progress' } })
       );
       setDraft('');
+      setPin(null);
       pager.reset();
       setToast(`Added: ${title}`);
     } catch (err) {
@@ -217,12 +208,17 @@ export default function App() {
   };
 
   const pendingIds = new Set(snapshot?.pending_ids ?? []);
+  const stamp = version ? `v${version}` : '';
+  const who = initials(viewer?.display_name);
 
   return (
     <div className="app">
       <header className="titlebar" data-tauri-drag-region>
         <span className="titlebar__name" data-tauri-drag-region>
           OMSN
+        </span>
+        <span className="titlebar__clock" data-tauri-drag-region>
+          {formatClock(now)}
         </span>
         <span className="titlebar__count" data-tauri-drag-region>
           {viewer ? `${tasks.length} ACTIVE` : ''}
@@ -247,6 +243,19 @@ export default function App() {
               {busy ? 'WAIT...' : 'SIGN IN'}
             </button>
           )}
+        </div>
+      )}
+
+      {writeError && (
+        <div className="notice notice--error">
+          <span>Change not saved. {writeError}</span>
+          <button
+            className="pixel-btn pixel-btn--ghost"
+            title="Dismiss"
+            onClick={() => setWriteError(null)}
+          >
+            ✕
+          </button>
         </div>
       )}
 
@@ -307,6 +316,8 @@ export default function App() {
               key={task.record_id}
               task={task}
               pending={pendingIds.has(task.record_id)}
+              expanded={expandedId === task.record_id}
+              onToggleExpand={(id) => setExpandedId((current) => (current === id ? null : id))}
               onSetStatus={(t, s) => void setStatus(t, s)}
               onAskDone={setConfirmDone}
             />
@@ -358,6 +369,7 @@ export default function App() {
         >
           ›
         </button>
+        <span className="pager__version">{who ? `${stamp} · ${who}` : stamp}</span>
         <span className="pager__synced">
           {snapshot?.fetched_at_millis ? relativeTime(snapshot.fetched_at_millis) : ''}
         </span>

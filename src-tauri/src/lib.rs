@@ -2,9 +2,12 @@ pub mod auth;
 pub mod commands;
 pub mod config;
 pub mod error;
+#[cfg(test)]
+pub mod fake_repo;
 pub mod lark;
 pub mod oauth;
 pub mod repo;
+pub mod store_cell;
 pub mod sync;
 pub mod task;
 

@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useState } from 'react';
 
-/** Measured height of one task row at the current type scale:
- *  padding 24 + title 18 + gap 6 + meta 15 + border 2. */
+/** Measured height of one **collapsed** task row at the current type scale:
+ *  padding 24 + title 18 + gap 6 + meta 15 + border 2.
+ *
+ *  An expanded row (R3) is taller, by as many lines as its title needs. Page
+ *  size is deliberately not reduced to compensate: shrinking `perPage` while
+ *  a row is open could push that very row onto the next page, which is the
+ *  "the row I touched disappeared" failure R5 exists to remove. `.list` is
+ *  `overflow-y: auto`, so the page scrolls instead of clipping, and
+ *  `TaskRow` scrolls the row it just opened back into view. */
 const ROW_HEIGHT_PX = 66;
 /** Titlebar (44) + add bar (48) + pager (46) + list padding.
  *  The add bar was missing from this total, which overflowed the list. */

@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import type { Task } from './types';
-import { STATUS_ICON, daysSince, isStale, priorityRank, sortTasks } from './types';
+import {
+  STATUS_ICON,
+  daysSince,
+  formatClock,
+  initials,
+  isStale,
+  pinTask,
+  priorityRank,
+  sortTasks,
+} from './types';
 
 function task(over: Partial<Task> = {}): Task {
   return {
@@ -116,5 +125,89 @@ describe('STATUS_ICON', () => {
     for (const s of ['Backlog', 'This Week', 'In Progress', 'On Hold', 'Done']) {
       expect(STATUS_ICON[s], `${s} needs a marker`).toBeTruthy();
     }
+  });
+});
+
+describe('pinTask', () => {
+  /** The exact R5 symptom: moving an In Progress task back to Backlog sends
+   *  it to the bottom of the list, which on a paged list is off screen. */
+  const list = () => [
+    task({ record_id: 'a', status: 'In Progress', modified: 1 }),
+    task({ record_id: 'b', status: 'In Progress', modified: 2 }),
+    task({ record_id: 'c', status: 'Backlog', modified: 3 }),
+    task({ record_id: 'd', status: 'Backlog', modified: 4 }),
+  ];
+
+  it('holds a just-changed row in the slot it was clicked in', () => {
+    // The user clicked row 0; its new status sorts it last.
+    const moved = sortTasks([
+      task({ record_id: 'b', status: 'In Progress', modified: 2 }),
+      task({ record_id: 'c', status: 'Backlog', modified: 3 }),
+      task({ record_id: 'd', status: 'Backlog', modified: 4 }),
+      task({ record_id: 'a', status: 'Backlog', modified: 9 }),
+    ]);
+    expect(moved.map((t) => t.record_id)).toEqual(['b', 'c', 'd', 'a']);
+
+    const pinned = pinTask(moved, { recordId: 'a', index: 0, fetchedAt: 1 });
+    expect(
+      pinned.map((t) => t.record_id),
+      'the row the user touched must not leave the page it was on'
+    ).toEqual(['a', 'b', 'c', 'd']);
+  });
+
+  it('does not mutate the list it is given', () => {
+    const before = list();
+    pinTask(before, { recordId: 'd', index: 0, fetchedAt: 1 });
+    expect(before.map((t) => t.record_id)).toEqual(['a', 'b', 'c', 'd']);
+  });
+
+  it('is a no-op with no pin, an unknown row, or a row already in place', () => {
+    expect(pinTask(list(), null).map((t) => t.record_id)).toEqual(['a', 'b', 'c', 'd']);
+    expect(
+      pinTask(list(), { recordId: 'gone', index: 0, fetchedAt: 1 }).map((t) => t.record_id)
+    ).toEqual(['a', 'b', 'c', 'd']);
+    expect(
+      pinTask(list(), { recordId: 'a', index: 0, fetchedAt: 1 }).map((t) => t.record_id)
+    ).toEqual(['a', 'b', 'c', 'd']);
+  });
+
+  it('clamps an index that no longer exists instead of dropping the row', () => {
+    // A row completed elsewhere can shrink the list under a stale pin.
+    const two = [task({ record_id: 'a' }), task({ record_id: 'b' })];
+    const pinned = pinTask(two, { recordId: 'a', index: 9, fetchedAt: 1 });
+    expect(pinned.map((t) => t.record_id)).toEqual(['b', 'a']);
+    expect(pinned).toHaveLength(2);
+  });
+});
+
+describe('initials', () => {
+  it('takes the first and last initial of a full name', () => {
+    expect(initials('Adrian Chong')).toBe('AC');
+    expect(initials('Ng Shi En')).toBe('NE');
+  });
+
+  it('falls back to two letters for a single name', () => {
+    expect(initials('Adrian')).toBe('AD');
+  });
+
+  it('renders nothing rather than "undefined" before sign-in', () => {
+    expect(initials(null)).toBe('');
+    expect(initials(undefined)).toBe('');
+    expect(initials('   ')).toBe('');
+  });
+
+  it('keeps CJK names intact', () => {
+    expect(initials('张伟')).toBe('张伟');
+  });
+});
+
+describe('formatClock', () => {
+  it('shows hours and minutes with no seconds', () => {
+    expect(formatClock(new Date(2026, 9, 1, 17, 2), 'en-US')).toBe('5:02 PM');
+    expect(formatClock(new Date(2026, 9, 1, 9, 30), 'en-US')).toBe('9:30 AM');
+  });
+
+  it('follows the locale rather than hard-coding AM/PM', () => {
+    expect(formatClock(new Date(2026, 9, 1, 17, 2), 'en-GB')).toBe('17:02');
   });
 });

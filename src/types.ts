@@ -25,10 +25,19 @@ export interface Task {
   modified: number | null;
 }
 
+/** A write the Base refused. The command that sent it returned long before
+ *  the answer arrived, so the rejection travels back in a later snapshot. */
+export interface WriteFailure {
+  seq: number;
+  record_id: string;
+  message: string;
+}
+
 export interface Snapshot {
   tasks: Task[];
   fetched_at_millis: number;
   pending_ids: string[];
+  write_failures: WriteFailure[];
   stale: boolean;
 }
 
@@ -105,4 +114,47 @@ export function sortTasks(tasks: Task[]): Task[] {
     if (byPriority !== 0) return byPriority;
     return (a.modified ?? a.created ?? 0) - (b.modified ?? b.created ?? 0);
   });
+}
+
+/** A row held in place after the user changed its status.
+ *
+ *  `sortTasks` ranks Backlog 4th and orders within a group by `modified`
+ *  ascending, so the row you just touched has the newest timestamp and lands
+ *  at the very bottom of the list — off the current page as soon as there is
+ *  more than one page. The user sees it vanish with no clue where it went.
+ *
+ *  Rather than change the sort (which standup depends on), the row is pinned
+ *  to the slot it occupied until the next poll re-reads the server. */
+export interface Pin {
+  recordId: string;
+  /** Index in the full sorted list at the moment of the change. */
+  index: number;
+  /** The snapshot the pin was taken against; a newer poll releases it. */
+  fetchedAt: number;
+}
+
+/** Move the pinned row back to the index it held. Returns a new array. */
+export function pinTask(tasks: Task[], pin: Pin | null): Task[] {
+  if (!pin) return tasks;
+  const from = tasks.findIndex((t) => t.record_id === pin.recordId);
+  if (from === -1) return tasks;
+  const to = Math.max(0, Math.min(pin.index, tasks.length - 1));
+  if (from === to) return tasks;
+  const next = [...tasks];
+  const [moved] = next.splice(from, 1);
+  next.splice(to, 0, moved);
+  return next;
+}
+
+/** Up to two letters standing in for a name, Penguin-style ("v0.1.0 . AC"). */
+export function initials(displayName: string | null | undefined): string {
+  const words = (displayName ?? '').trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return '';
+  if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+  return (words[0][0] + words[words.length - 1][0]).toUpperCase();
+}
+
+/** Wall-clock time in the user's own locale and 12/24-hour convention. */
+export function formatClock(at: Date, locale?: string): string {
+  return at.toLocaleTimeString(locale, { hour: 'numeric', minute: '2-digit' });
 }

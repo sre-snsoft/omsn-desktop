@@ -100,10 +100,18 @@ button {
   text-shadow: 2px 2px 0 var(--shadow);
 }
 
-.titlebar__count {
+/* Inside the drag region, so the window still drags from the clock. */
+.titlebar__clock {
   color: var(--muted);
   margin-left: auto;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.titlebar__count {
+  color: var(--muted);
   font-size: 8px;
+  white-space: nowrap;
 }
 
 /* Chunky square buttons with a hard offset shadow that "presses" in. */
@@ -228,6 +236,7 @@ button {
 }
 
 .task {
+  position: relative; /* the action buttons are laid over the row */
   display: flex;
   gap: 10px;
   align-items: flex-start;
@@ -279,6 +288,18 @@ button {
   gap: 6px;
   min-width: 0;
   flex: 1 1 auto;
+  text-align: left;
+}
+
+.task__body:focus-visible {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 2px;
+}
+
+/* Only the expanded row reserves space for the overlaid actions, so the text
+   being read is never covered. Collapsed rows keep the full width. */
+.task--expanded .task__body {
+  padding-right: 68px;
 }
 
 .task__title {
@@ -286,6 +307,14 @@ button {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Clicking the body lifts the clamp so the whole title wraps. */
+.task__title--expanded {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: break-word;
 }
 
 .task__meta {
@@ -321,17 +350,24 @@ button {
   color: var(--warn);
 }
 
-/* Per-task actions, revealed on hover so rows stay quiet at rest. */
+/* Per-task actions, revealed on hover so rows stay quiet at rest.
+   Laid over the row rather than in the flex flow: hidden-but-in-flow buttons
+   still ate their width from every title, costing roughly 7 characters a row
+   even when nobody was hovering. */
 .task__actions {
+  position: absolute;
+  top: 10px;
+  right: 10px;
   display: flex;
   gap: 4px;
-  flex: 0 0 auto;
   opacity: 0;
+  pointer-events: none;
 }
 
 .task:hover .task__actions,
 .task__actions:focus-within {
   opacity: 1;
+  pointer-events: auto;
 }
 
 .task__actions button {
@@ -445,10 +481,19 @@ button {
   font-size: 9px;
 }
 
-.pager__synced {
+/* Read from the Tauri API at runtime, so it cannot drift from the real
+   bundle version the way three hand-edited files do. */
+.pager__version {
   margin-left: auto;
   color: var(--muted);
   font-size: 8px;
+  white-space: nowrap;
+}
+
+.pager__synced {
+  color: var(--muted);
+  font-size: 8px;
+  white-space: nowrap;
 }
 
 /* Narrow: drop secondary detail so titles stay readable. */
@@ -456,7 +501,8 @@ button {
   .task__meta .chip {
     display: none;
   }
-  .pager__synced {
+  .pager__synced,
+  .pager__version {
     display: none;
   }
 }
