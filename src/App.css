@@ -179,6 +179,15 @@ button {
   flex: 0 0 auto;
 }
 
+/* Points at the file to fix, for an error signing in cannot repair. */
+.notice__hint {
+  font-size: 8px;
+  opacity: 0.85;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* ── Add form ────────────────────────────────────────────────────── */
 .add {
   display: flex;

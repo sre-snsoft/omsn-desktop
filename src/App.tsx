@@ -239,6 +239,9 @@ export default function App() {
       {error && (
         <div className="notice notice--error">
           <span>{error.message}</span>
+          {error.kind === 'config' && (
+            <span className="notice__hint">Check ~/.config/omsn/desktop.env</span>
+          )}
           {error.needs_login && (
             <button className="pixel-btn" onClick={() => void authorize()} disabled={busy}>
               {busy ? 'WAIT...' : 'SIGN IN'}
@@ -274,9 +277,9 @@ export default function App() {
       )}
 
       <main className="list">
-        {!viewer && !error && busy && <p className="empty">CONNECTING...</p>}
+        {!viewer && busy && <p className="empty">CONNECTING...</p>}
 
-        {!viewer && !error && !busy && (
+        {!viewer && !busy && (
           <div className="welcome">
             <p className="welcome__title">OMSN DESKTOP</p>
             <p className="welcome__sub">
