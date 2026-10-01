@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::error::{CoreError, Result};
+use crate::error::Result;
 
 pub const ENV_FILE: &str = "desktop.env";
 pub const TOKEN_FILE: &str = "token.json";
@@ -149,7 +149,7 @@ mod secret_hygiene {
     fn a_missing_key_error_names_only_the_key() {
         let env = parse_env("OMSN_LARK_APP_SECRET=SECRET-sentinel-9f3c1\n");
         assert!(env.get("OMSN_BASE_TOKEN").is_none());
-        let err = CoreError::Config(format!("{} is not set in {ENV_FILE}", "OMSN_BASE_TOKEN"));
+        let err = crate::error::CoreError::Config(format!("{} is not set in {ENV_FILE}", "OMSN_BASE_TOKEN"));
         assert!(!err.to_string().contains("SECRET-sentinel-9f3c1"));
     }
 
