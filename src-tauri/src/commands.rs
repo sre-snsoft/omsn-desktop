@@ -15,6 +15,7 @@ use crate::auth::{self, TokenSet};
 use crate::config::AppConfig;
 use crate::error::{Result, UiError};
 use crate::lark::BitableRepo;
+use crate::oauth;
 use crate::repo::TaskPatch;
 use crate::sync::{Snapshot, Store};
 use crate::task::Viewer;
@@ -75,6 +76,46 @@ pub async fn sign_in(state: State<'_, AppState>) -> std::result::Result<Viewer, 
     *state.store.write().await = Some(store);
     *state.viewer.write().await = Some(viewer.clone());
     Ok(viewer)
+}
+
+/// Full browser sign-in: consent, loopback redirect, code exchange.
+///
+/// Unlike `sign_in` (which only reuses or refreshes a stored session) this can
+/// recover from a dead or missing refresh token, which is the only way a new
+/// teammate can authenticate at all.
+#[tauri::command]
+pub async fn authorize(state: State<'_, AppState>) -> std::result::Result<Viewer, UiError> {
+    let _lock = state.connecting.lock().await;
+    let cfg = AppConfig::load()?;
+
+    // A non-loopback redirect would send the code to someone else while we
+    // waited locally and timed out, so refuse before opening a browser.
+    oauth::validate_redirect(&cfg.oauth_redirect)?;
+    let port = oauth::redirect_port(&cfg.oauth_redirect)?;
+    let pending = oauth::begin(&cfg, &cfg.oauth_redirect);
+
+    open_in_browser(&pending.url)?;
+
+    // The listener is synchronous and blocks; keep it off the async runtime.
+    let expected = pending.state.clone();
+    let code = tokio::task::spawn_blocking(move || oauth::wait_for_code(port, &expected))
+        .await
+        .map_err(|e| crate::error::CoreError::Auth(format!("sign-in task failed: {e}")))??;
+
+    let http = reqwest::Client::new();
+    let tokens = oauth::exchange(&http, &cfg, &pending, &code, Utc::now().timestamp()).await?;
+    auth::save_tokens(&tokens)?;
+    *state.tokens.lock().await = tokens;
+
+    let (store, viewer) = connect(state.tokens.clone()).await?;
+    *state.store.write().await = Some(store);
+    *state.viewer.write().await = Some(viewer.clone());
+    Ok(viewer)
+}
+
+fn open_in_browser(url: &str) -> Result<()> {
+    tauri_plugin_opener::open_url(url, None::<&str>)
+        .map_err(|e| crate::error::CoreError::Auth(format!("Could not open the browser: {e}")))
 }
 
 #[tauri::command]

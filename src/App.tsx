@@ -126,6 +126,23 @@ export default function App() {
     }
   }, []);
 
+  /// Full browser consent. The only path that works for someone with no
+  /// stored session — a new teammate, or an expired refresh token.
+  const authorize = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    setToast('Opening your browser...');
+    try {
+      setViewer(await invoke<Viewer>('authorize'));
+      await load(true);
+      setToast('Signed in');
+    } catch (err) {
+      setError(err as UiError);
+    } finally {
+      setBusy(false);
+    }
+  }, [load]);
+
   const signIn = useCallback(async () => {
     setBusy(true);
     // Clear first so a repeated failure still reads as a fresh attempt rather
@@ -223,8 +240,8 @@ export default function App() {
         <div className="notice notice--error">
           <span>{error.message}</span>
           {error.needs_login && (
-            <button className="pixel-btn" onClick={() => void signIn()} disabled={busy}>
-              {busy ? '...' : 'SIGN IN'}
+            <button className="pixel-btn" onClick={() => void authorize()} disabled={busy}>
+              {busy ? 'WAIT...' : 'SIGN IN'}
             </button>
           )}
         </div>
@@ -257,7 +274,21 @@ export default function App() {
       )}
 
       <main className="list">
-        {!viewer && !error && <p className="empty">CONNECTING...</p>}
+        {!viewer && !error && busy && <p className="empty">CONNECTING...</p>}
+
+        {!viewer && !error && !busy && (
+          <div className="welcome">
+            <p className="welcome__title">OMSN DESKTOP</p>
+            <p className="welcome__sub">
+              Sign in with Lark to see
+              <br />
+              the tasks assigned to you.
+            </p>
+            <button className="pixel-btn" onClick={() => void authorize()} disabled={busy}>
+              SIGN IN WITH LARK
+            </button>
+          </div>
+        )}
 
         {viewer && tasks.length === 0 && (
           <p className="empty">

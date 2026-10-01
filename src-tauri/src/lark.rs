@@ -250,6 +250,7 @@ mod tests {
             table_id: "tbl456".into(),
             app_id: "cli_test".into(),
             app_secret: "secret".into(),
+            oauth_redirect: "http://127.0.0.1:8765/callback".into(),
         };
         let tokens = TokenSet {
             access_token: "tok".into(),
@@ -310,6 +311,7 @@ mod tests {
             table_id: "tbl456".into(),
             app_id: "cli_test".into(),
             app_secret: "secret".into(),
+            oauth_redirect: "http://127.0.0.1:8765/callback".into(),
         };
         BitableRepo::new(cfg, Arc::new(Mutex::new(tokens))).unwrap()
     }

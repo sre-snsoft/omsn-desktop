@@ -338,6 +338,29 @@ button {
   line-height: 2.1;
 }
 
+/* First-run / signed-out screen. */
+.welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 40px 20px;
+  text-align: center;
+}
+
+.welcome__title {
+  font-size: 13px;
+  margin: 0;
+  text-shadow: 2px 2px 0 var(--shadow);
+}
+
+.welcome__sub {
+  margin: 0;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 2;
+}
+
 /* ── Confirm dialog ──────────────────────────────────────────────── */
 .confirm {
   position: absolute;

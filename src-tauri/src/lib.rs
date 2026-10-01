@@ -3,6 +3,7 @@ pub mod commands;
 pub mod config;
 pub mod error;
 pub mod lark;
+pub mod oauth;
 pub mod repo;
 pub mod sync;
 pub mod task;
@@ -16,6 +17,7 @@ pub fn run() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             commands::sign_in,
+            commands::authorize,
             commands::current_viewer,
             commands::list_my_tasks,
             commands::update_task,

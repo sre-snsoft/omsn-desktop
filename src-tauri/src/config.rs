@@ -23,6 +23,8 @@ pub struct AppConfig {
     /// Needed to refresh an expired session without a browser round trip.
     pub app_id: String,
     pub app_secret: String,
+    /// Loopback URI registered in the Lark console for the sign-in redirect.
+    pub oauth_redirect: String,
 }
 
 /// Parse `KEY=VALUE` lines, tolerating comments, blanks, `export ` and quotes.
@@ -67,6 +69,7 @@ impl AppConfig {
             table_id: need("OMSN_TABLE_ID")?,
             app_id: need("OMSN_LARK_APP_ID")?,
             app_secret: need("OMSN_LARK_APP_SECRET")?,
+            oauth_redirect: need("OMSN_OAUTH_REDIRECT")?,
         })
     }
 }
