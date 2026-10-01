@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 
-/** Measured height of one task row (title + meta line + borders). */
-const ROW_HEIGHT_PX = 55;
-/** Titlebar (33) + pager (35) + list padding. */
-const CHROME_PX = 76;
+/** Measured height of one task row at the current type scale:
+ *  padding 24 + title 18 + gap 6 + meta 15 + border 2. */
+const ROW_HEIGHT_PX = 66;
+/** Titlebar (44) + add bar (48) + pager (46) + list padding.
+ *  The add bar was missing from this total, which overflowed the list. */
+const CHROME_PX = 142;
 const MIN_PER_PAGE = 3;
 
 /**
