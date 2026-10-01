@@ -75,7 +75,6 @@ impl BitableRepo {
         let refreshed = auth::refresh(
             &self.http,
             &self.cfg.app_id,
-            &self.cfg.app_secret,
             &guard.refresh_token,
             Self::now_secs(),
         )
@@ -102,7 +101,6 @@ impl BitableRepo {
         let refreshed = auth::refresh(
             &self.http,
             &self.cfg.app_id,
-            &self.cfg.app_secret,
             &guard.refresh_token,
             Self::now_secs(),
         )
@@ -249,7 +247,6 @@ mod tests {
             base_token: "bas123".into(),
             table_id: "tbl456".into(),
             app_id: "cli_test".into(),
-            app_secret: "secret".into(),
             oauth_redirect: "http://127.0.0.1:8765/callback".into(),
         };
         let tokens = TokenSet {
@@ -310,7 +307,6 @@ mod tests {
             base_token: "bas123".into(),
             table_id: "tbl456".into(),
             app_id: "cli_test".into(),
-            app_secret: "secret".into(),
             oauth_redirect: "http://127.0.0.1:8765/callback".into(),
         };
         BitableRepo::new(cfg, Arc::new(Mutex::new(tokens))).unwrap()

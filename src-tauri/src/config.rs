@@ -11,34 +11,32 @@ use crate::error::{CoreError, Result};
 pub const ENV_FILE: &str = "desktop.env";
 pub const TOKEN_FILE: &str = "token.json";
 
+/// Built-in defaults, so a teammate can run the app with no setup at all.
+///
+/// None of these are secrets. The app id is already public — it travels in the
+/// authorize URL — and the Base/table ids are addresses, not credentials:
+/// reaching the data still requires that person's own Lark session and their
+/// own Base permissions. Verified against the live tenant that Lark accepts a
+/// PKCE exchange with no client secret, which is what makes this possible.
+pub mod defaults {
+    pub const APP_ID: &str = "cli_aa31efc9e838df0e";
+    pub const BASE_TOKEN: &str = "SW1zbLwdNaYsyAsIpBElmk8rglh";
+    pub const TABLE_ID: &str = "tblvOg8Ge09bG85d";
+    pub const OAUTH_REDIRECT: &str = "http://localhost:8765/callback";
+}
+
 pub fn config_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
     PathBuf::from(home).join(".config").join("omsn")
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AppConfig {
     pub base_token: String,
     pub table_id: String,
-    /// Needed to refresh an expired session without a browser round trip.
     pub app_id: String,
-    pub app_secret: String,
     /// Loopback URI registered in the Lark console for the sign-in redirect.
     pub oauth_redirect: String,
-}
-
-/// Hand-written so the client secret cannot reach a log, a panic message or a
-/// `{:?}`. A derived Debug would print it verbatim.
-impl std::fmt::Debug for AppConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AppConfig")
-            .field("base_token", &self.base_token)
-            .field("table_id", &self.table_id)
-            .field("app_id", &self.app_id)
-            .field("app_secret", &"<redacted>")
-            .field("oauth_redirect", &self.oauth_redirect)
-            .finish()
-    }
 }
 
 /// Parse `KEY=VALUE` lines, tolerating comments, blanks, `export ` and quotes.
@@ -63,27 +61,25 @@ pub fn parse_env(contents: &str) -> HashMap<String, String> {
 }
 
 impl AppConfig {
+    /// Built-in defaults, optionally overridden by `~/.config/omsn/desktop.env`.
+    ///
+    /// A missing file is normal, not an error: the app must work on a fresh
+    /// machine with nothing configured.
     pub fn load() -> Result<Self> {
         let path = config_dir().join(ENV_FILE);
-        let contents = std::fs::read_to_string(&path).map_err(|e| {
-            CoreError::Config(format!("Cannot read {}: {e}", path.display()))
-        })?;
-        let values = parse_env(&contents);
-
-        let need = |key: &str| -> Result<String> {
-            values
-                .get(key)
+        let values = std::fs::read_to_string(&path).map(|c| parse_env(&c)).unwrap_or_default();
+        let pick = |key: &str, fallback: &str| -> String {
+            std::env::var(key)
+                .ok()
+                .or_else(|| values.get(key).cloned())
                 .filter(|v| !v.is_empty())
-                .cloned()
-                .ok_or_else(|| CoreError::Config(format!("{key} is not set in {ENV_FILE}")))
+                .unwrap_or_else(|| fallback.to_string())
         };
-
         Ok(AppConfig {
-            base_token: need("OMSN_BASE_TOKEN")?,
-            table_id: need("OMSN_TABLE_ID")?,
-            app_id: need("OMSN_LARK_APP_ID")?,
-            app_secret: need("OMSN_LARK_APP_SECRET")?,
-            oauth_redirect: need("OMSN_OAUTH_REDIRECT")?,
+            base_token: pick("OMSN_BASE_TOKEN", defaults::BASE_TOKEN),
+            table_id: pick("OMSN_TABLE_ID", defaults::TABLE_ID),
+            app_id: pick("OMSN_LARK_APP_ID", defaults::APP_ID),
+            oauth_redirect: pick("OMSN_OAUTH_REDIRECT", defaults::OAUTH_REDIRECT),
         })
     }
 }
@@ -132,7 +128,6 @@ mod secret_hygiene {
             base_token: "bascnTEST".into(),
             table_id: "tblTEST".into(),
             app_id: "cli_test".into(),
-            app_secret: "SECRET-sentinel-9f3c1".into(),
             oauth_redirect: "http://127.0.0.1:8765/callback".into(),
         }
     }
@@ -187,5 +182,41 @@ mod secret_hygiene {
             env.get("OMSN_OAUTH_REDIRECT").map(String::as_str),
             Some("http://127.0.0.1:8765/callback")
         );
+    }
+}
+
+#[cfg(test)]
+mod zero_config {
+    use super::*;
+
+    /// A teammate on a fresh machine has no env file and no env vars. The app
+    /// must still know which Lark app and which Base to talk to, or a .dmg is
+    /// useless without hand-placed config.
+    #[test]
+    fn load_succeeds_with_no_configuration_at_all() {
+        // Guard against a developer's own exports leaking into the assertion.
+        for key in ["OMSN_BASE_TOKEN", "OMSN_TABLE_ID", "OMSN_LARK_APP_ID", "OMSN_OAUTH_REDIRECT"] {
+            if std::env::var(key).is_ok() {
+                eprintln!("skipping: {key} is set in this environment");
+                return;
+            }
+        }
+        let cfg = AppConfig::load().expect("must not require a config file");
+        assert_eq!(cfg.app_id, defaults::APP_ID);
+        assert_eq!(cfg.base_token, defaults::BASE_TOKEN);
+        assert_eq!(cfg.table_id, defaults::TABLE_ID);
+        assert!(cfg.oauth_redirect.contains("8765"));
+    }
+
+    #[test]
+    fn the_built_in_defaults_are_all_populated() {
+        for (name, value) in [
+            ("APP_ID", defaults::APP_ID),
+            ("BASE_TOKEN", defaults::BASE_TOKEN),
+            ("TABLE_ID", defaults::TABLE_ID),
+            ("OAUTH_REDIRECT", defaults::OAUTH_REDIRECT),
+        ] {
+            assert!(!value.is_empty(), "{name} default must not be empty");
+        }
     }
 }

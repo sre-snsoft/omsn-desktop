@@ -5,9 +5,11 @@
 //! with a code. Ported from `probe/lark_auth.py`, which proved this exact
 //! exchange against the live tenant.
 //!
-//! PKCE is sent when enabled. It does not replace the client secret for Lark
-//! (the token endpoint still requires it), but it does stop another local
-//! process from racing the loopback redirect and stealing the code.
+//! PKCE does the real work here. Lark accepts the exchange as a public client,
+//! so no client secret ships with the app — which is what lets a teammate run
+//! it with nothing configured. PKCE is then the only thing binding the code to
+//! this process, so another local program cannot race the loopback redirect
+//! and redeem a stolen code.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -257,7 +259,6 @@ pub async fn exchange(
         .json(&serde_json::json!({
             "grant_type": "authorization_code",
             "client_id": cfg.app_id,
-            "client_secret": cfg.app_secret,
             "code": code,
             "redirect_uri": pending.redirect,
             "code_verifier": pending.verifier,
@@ -318,7 +319,6 @@ mod tests {
             base_token: "bas".into(),
             table_id: "tbl".into(),
             app_id: "cli_test".into(),
-            app_secret: "secret".into(),
             oauth_redirect: "http://127.0.0.1:8765/callback".into(),
         }
     }
@@ -413,7 +413,6 @@ mod hardening {
             base_token: "bascnTEST".into(),
             table_id: "tblTEST".into(),
             app_id: "cli_test".into(),
-            app_secret: SENTINEL_SECRET.into(),
             oauth_redirect: "http://127.0.0.1:8765/callback".into(),
         }
     }
