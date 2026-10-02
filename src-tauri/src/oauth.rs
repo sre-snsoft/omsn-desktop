@@ -125,20 +125,69 @@ fn parse_pairs(query: &str) -> Vec<(String, String)> {
 /// including any page in the browser — must not be able to grow this buffer.
 const MAX_REQUEST_LINE: u64 = 8 * 1024;
 
-/// Reserve the redirect port.
+/// Both loopback addresses the redirect could arrive on.
+///
+/// `localhost` resolves to *both* `127.0.0.1` and `::1`, and browsers on macOS
+/// commonly try the IPv6 address first. Listening on IPv4 alone meant the
+/// browser hit a refused connection on `[::1]`, never delivered the code, and
+/// the user came back to an app that had silently timed out.
+#[derive(Debug)]
+pub struct Loopback {
+    listeners: Vec<TcpListener>,
+}
+
+impl Loopback {
+    /// Accept from whichever address the browser actually used.
+    fn accept(&self) -> std::io::Result<Option<TcpStream>> {
+        for listener in &self.listeners {
+            match listener.accept() {
+                Ok((stream, _)) => return Ok(Some(stream)),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    fn families(&self) -> usize {
+        self.listeners.len()
+    }
+}
+
+/// Reserve the redirect port on every loopback address.
 ///
 /// Called *before* the browser is opened: otherwise the user could consent and
 /// have the code delivered to whatever already holds the port.
-pub fn bind_listener(port: u16) -> Result<TcpListener> {
-    let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
-        CoreError::Config(format!(
-            "Cannot listen on 127.0.0.1:{port} for the sign-in redirect              (is another copy of OMSN running?): {e}"
-        ))
-    })?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| CoreError::Config(e.to_string()))?;
-    Ok(listener)
+///
+/// Succeeds if at least one family binds — a machine with IPv6 disabled is
+/// still perfectly usable — but fails loudly if neither does.
+pub fn bind_listener(port: u16) -> Result<Loopback> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let mut listeners = Vec::new();
+    let mut last_error = None;
+    for addr in [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+    ] {
+        match TcpListener::bind((addr, port)) {
+            Ok(listener) => match listener.set_nonblocking(true) {
+                Ok(()) => listeners.push(listener),
+                Err(e) => last_error = Some(e.to_string()),
+            },
+            Err(e) => last_error = Some(e.to_string()),
+        }
+    }
+
+    if listeners.is_empty() {
+        return Err(CoreError::Config(format!(
+            "Cannot listen on port {port} for the sign-in redirect \
+             (is another copy of OMSN running?): {}",
+            last_error.unwrap_or_else(|| "no loopback address available".into())
+        )));
+    }
+    Ok(Loopback { listeners })
 }
 
 /// What one connection turned out to be.
@@ -211,7 +260,7 @@ fn describe_error(raw: Option<&str>) -> String {
 /// ordinary traffic, not just an attack.
 ///
 /// Synchronous by nature: run it on a blocking thread, never the async runtime.
-pub fn wait_for_code(listener: TcpListener, expected_state: &str) -> Result<String> {
+pub fn wait_for_code(listener: Loopback, expected_state: &str) -> Result<String> {
     let (tx, rx) = std::sync::mpsc::channel::<Outcome>();
     let deadline = Instant::now() + CONSENT_TIMEOUT;
 
@@ -222,14 +271,14 @@ pub fn wait_for_code(listener: TcpListener, expected_state: &str) -> Result<Stri
         }
 
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok(Some(stream)) => {
                 let tx = tx.clone();
                 let state = expected_state.to_string();
                 std::thread::spawn(move || {
                     let _ = tx.send(serve(stream, &state));
                 });
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(None) => {}
             Err(e) => return Err(CoreError::Config(format!("redirect listener failed: {e}"))),
         }
 
@@ -640,15 +689,25 @@ mod hardening {
     }
 
     /// A second sign-in (or any other local process) holding the redirect port
-    /// makes the listener unbindable. `authorize` opens the browser BEFORE it
-    /// gets here, so the user consents and the code lands nowhere.
+    /// makes the listener unbindable. `authorize` binds before opening the
+    /// browser, so this must fail before the user ever consents.
+    ///
+    /// Both loopback families have to be occupied to make the port genuinely
+    /// unavailable — holding only IPv4 still leaves `[::1]` free, and the code
+    /// can still be delivered there.
     #[test]
-    fn a_taken_redirect_port_fails_fast_with_a_config_error() {
-        let squatter = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = squatter.local_addr().unwrap().port();
+    fn a_fully_taken_redirect_port_fails_fast_with_a_config_error() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-        // bind_listener is now a separate step, called before the browser is
-        // opened, so an occupied port fails before the user ever consents.
+        let v4 = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let v6 = TcpListener::bind((IpAddr::V6(Ipv6Addr::LOCALHOST), port));
+        if v6.is_err() {
+            // The OS gave us a port already busy on IPv6; nothing to assert.
+            return;
+        }
+        let _ = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
         let started = Instant::now();
         let err = bind_listener(port).unwrap_err();
         assert!(
@@ -660,7 +719,37 @@ mod hardening {
             !err.to_string().contains(SENTINEL_SECRET),
             "bind error must not carry credentials"
         );
-        drop(squatter);
+    }
+
+    /// The regression that broke sign-in: `localhost` resolves to both
+    /// `127.0.0.1` and `::1`, and a browser preferring IPv6 hit a refused
+    /// connection when only IPv4 was bound. The code was never delivered and
+    /// the app sat waiting until it timed out.
+    #[test]
+    fn the_redirect_is_reachable_on_both_loopback_families() {
+        use std::net::{IpAddr, Ipv6Addr};
+
+        let probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let bound = bind_listener(port).expect("must bind at least one family");
+        let ipv6_available = TcpListener::bind((IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).is_ok();
+        if ipv6_available {
+            assert_eq!(
+                bound.families(),
+                2,
+                "a browser may use either address, so both must be listening"
+            );
+        }
+
+        // Whichever families bound must actually accept a connection.
+        for addr in ["127.0.0.1", "::1"] {
+            let sock: std::net::IpAddr = addr.parse().unwrap();
+            if let Ok(mut s) = TcpStream::connect((sock, port)) {
+                let _ = s.write_all(b"GET /callback?state=x HTTP/1.1\r\n\r\n");
+            }
+        }
     }
 
     /// A redirect carrying somebody else's state must be ignored, and the real
