@@ -133,7 +133,14 @@ pub async fn refresh(
 
     let body: Value = resp.json().await?;
     let code = body.get("code").and_then(Value::as_i64).unwrap_or(0);
-    if code != 0 {
+    let oauth_error = body.get("error").and_then(Value::as_str);
+    if code != 0 || oauth_error.is_some() {
+        eprintln!(
+            "OMSN refresh: rejected (code {:?}, error {:?}, {:?})",
+            code,
+            oauth_error,
+            body.get("error_description").and_then(Value::as_str)
+        );
         // A dead refresh token is the one case the user must act on.
         return Err(CoreError::Auth(
             "Your saved session is no longer valid. Sign in again.".into(),

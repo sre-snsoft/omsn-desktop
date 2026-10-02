@@ -315,14 +315,30 @@ pub async fn exchange(
         .send()
         .await?;
 
+    let status = resp.status();
     let body: Value = resp.json().await?;
     let lark_code = body.get("code").and_then(Value::as_i64).unwrap_or(0);
-    if lark_code != 0 {
-        // Report msg only: the body can carry tokens.
-        return Err(CoreError::Auth(format!(
-            "Sign-in failed: {}",
-            body.get("msg").and_then(Value::as_str).unwrap_or("unknown error")
-        )));
+    // Lark reports OAuth problems two ways: a non-zero `code`, or an RFC 6749
+    // `error` string with no code at all. Treating only the former as failure
+    // let a rejected exchange look successful and surface later as a confusing
+    // "session expired".
+    let oauth_error = body.get("error").and_then(Value::as_str);
+    if lark_code != 0 || oauth_error.is_some() {
+        // Diagnosable without leaking: these fields never carry a token.
+        eprintln!(
+            "OMSN sign-in: token exchange rejected (http {}, code {:?}, error {:?}, {:?})",
+            status.as_u16(),
+            lark_code,
+            oauth_error,
+            body.get("error_description").and_then(Value::as_str)
+        );
+        let detail = body
+            .get("error_description")
+            .and_then(Value::as_str)
+            .or_else(|| body.get("msg").and_then(Value::as_str))
+            .unwrap_or("Lark rejected the sign-in");
+        let label = oauth_error.unwrap_or("error");
+        return Err(CoreError::Auth(format!("{detail} ({label})")));
     }
     TokenSet::from_response(&body, now_secs)
 }
