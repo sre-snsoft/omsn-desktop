@@ -199,6 +199,12 @@ impl BitableRepo {
 
 /// The `records/search` body that narrows a read to one person's rows.
 ///
+/// `contains`, not `is`. `Owner` holds multiple people, and `is` only matches
+/// a cell whose sole owner is the given person — verified against the live
+/// Base with a two-owner row, which `is` silently dropped and `contains`
+/// returned. Shared tasks are common in this tracker, so `is` would have hidden
+/// real work from the people assigned to it.
+///
 /// The open_id is spelled out. Lark rejects the literal `"CurrentUser"` here
 /// with 1254018 InvalidFilter, so there is no server-side shorthand for "me".
 fn owner_filter(open_id: &str) -> Value {
@@ -207,7 +213,7 @@ fn owner_filter(open_id: &str) -> Value {
             "conjunction": "and",
             "conditions": [{
                 "field_name": fields::OWNER,
-                "operator": "is",
+                "operator": "contains",
                 "value": [open_id],
             }],
         }
@@ -359,7 +365,11 @@ mod tests {
         let condition = &body["filter"]["conditions"][0];
         assert_eq!(body["filter"]["conjunction"], "and");
         assert_eq!(condition["field_name"], fields::OWNER);
-        assert_eq!(condition["operator"], "is");
+        assert_eq!(
+            condition["operator"], "contains",
+            "Owner holds several people; `is` matches only sole-owner rows and \
+             silently drops shared tasks"
+        );
         assert_eq!(condition["value"][0], "ou_abc");
     }
 
