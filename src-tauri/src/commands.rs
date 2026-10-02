@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
-use tauri::State;
+use chrono::{Local, Utc};
+use tauri::{AppHandle, Emitter, State};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::auth::{self, TokenSet};
@@ -16,8 +16,8 @@ use crate::config::AppConfig;
 use crate::error::{Result, UiError};
 use crate::lark::BitableRepo;
 use crate::oauth;
-use crate::repo::TaskPatch;
-use crate::store_cell::{self, StoreCell, WriteGate};
+use crate::repo::{stamp_completion, TaskPatch};
+use crate::store_cell::{self, SettleNotifier, StoreCell, WriteGate};
 use crate::sync::{Snapshot, Store};
 use crate::task::Viewer;
 
@@ -53,6 +53,24 @@ fn now_millis() -> i64 {
     Utc::now().timestamp_millis()
 }
 
+/// The Tauri event the UI listens on to drop a row's in-flight marker.
+pub const WRITE_SETTLED_EVENT: &str = "omsn://write-settled";
+
+/// Carries a settled write back to the webview.
+///
+/// `core:app:default` already grants `allow-register-listener`, so this needs
+/// no capability change. Only the record id travels — never a patch, never a
+/// response body.
+struct EmitToWindow(AppHandle);
+
+impl SettleNotifier for EmitToWindow {
+    fn write_settled(&self, record_id: &str) {
+        // A failed emit means there is no window left to tell; the backstop
+        // poll covers the rest. Nothing here is worth an error notice.
+        let _ = self.0.emit(WRITE_SETTLED_EVENT, record_id);
+    }
+}
+
 /// Build the repository and identify the user. Called once at startup and
 /// again after a sign-in.
 async fn connect(tokens: Arc<Mutex<TokenSet>>) -> Result<(Store<BitableRepo>, Viewer)> {
@@ -82,6 +100,7 @@ pub async fn sign_in(state: State<'_, AppState>) -> std::result::Result<Viewer, 
     let (store, viewer) = connect(state.tokens.clone()).await?;
     *state.store.write().await = Some(store);
     *state.viewer.write().await = Some(viewer.clone());
+    store_cell::calibrate_fetch_mode(&state.store, &viewer, now_millis()).await;
     Ok(viewer)
 }
 
@@ -121,6 +140,7 @@ pub async fn authorize(state: State<'_, AppState>) -> std::result::Result<Viewer
     let (store, viewer) = connect(state.tokens.clone()).await?;
     *state.store.write().await = Some(store);
     *state.viewer.write().await = Some(viewer.clone());
+    store_cell::calibrate_fetch_mode(&state.store, &viewer, now_millis()).await;
     Ok(viewer)
 }
 
@@ -148,7 +168,7 @@ pub async fn list_my_tasks(
         .ok_or_else(|| UiError::from(crate::error::CoreError::Unauthorized))?;
 
     if refresh {
-        if let Err(err) = store_cell::poll(&state.store, now_millis()).await {
+        if let Err(err) = store_cell::poll(&state.store, &viewer, now_millis()).await {
             // With no good snapshot behind it, an empty list would read as
             // "nothing assigned to you" — the opposite of what happened.
             let never_loaded = store_cell::fetched_at_millis(&state.store).await == 0;
@@ -163,6 +183,7 @@ pub async fn list_my_tasks(
 
 #[tauri::command]
 pub async fn update_task(
+    app: AppHandle,
     state: State<'_, AppState>,
     record_id: String,
     patch: TaskPatch,
@@ -173,6 +194,10 @@ pub async fn update_task(
         .await
         .clone()
         .ok_or_else(|| UiError::from(crate::error::CoreError::Unauthorized))?;
+
+    // Completing a task records the day it was completed. Decided here, not
+    // in the webview, and only ever on a write that sets Done.
+    let patch = stamp_completion(patch, Local::now());
 
     // Overlay the change and answer immediately: the PUT, a token refresh and
     // a possible retry are tens of seconds in the worst case, and the user
@@ -187,6 +212,7 @@ pub async fn update_task(
         state.store.clone(),
         state.write_gate.clone(),
         started.repo,
+        Arc::new(EmitToWindow(app)),
         record_id,
         patch,
         started.seq,
@@ -206,18 +232,14 @@ pub async fn create_task(
         .await
         .clone()
         .ok_or_else(|| UiError::from(crate::error::CoreError::Unauthorized))?;
-    let mut guard = state.store.write().await;
-    let store = guard
-        .as_mut()
-        .ok_or_else(|| UiError::from(crate::error::CoreError::Unauthorized))?;
 
     // A new task belongs to whoever created it unless stated otherwise.
+    let patch = stamp_completion(patch, Local::now());
     let patch = TaskPatch {
         owner_ids: patch.owner_ids.or_else(|| Some(vec![viewer.open_id.clone()])),
         ..patch
     };
-    store.create(patch).await?;
-    Ok(store.snapshot(&viewer))
+    Ok(store_cell::create(&state.store, &viewer, patch).await?)
 }
 
 /// Deleting is irreversible, so the UI must confirm before calling this.
@@ -232,13 +254,9 @@ pub async fn delete_task(
         .await
         .clone()
         .ok_or_else(|| UiError::from(crate::error::CoreError::Unauthorized))?;
-    let mut guard = state.store.write().await;
-    let store = guard
-        .as_mut()
-        .ok_or_else(|| UiError::from(crate::error::CoreError::Unauthorized))?;
 
-    store.delete(&record_id).await?;
-    Ok(store.snapshot(&viewer))
+    // Ownership is checked inside, before anything is sent.
+    Ok(store_cell::delete(&state.store, &viewer, &record_id).await?)
 }
 
 #[cfg(test)]

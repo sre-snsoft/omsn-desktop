@@ -10,6 +10,12 @@ pub enum CoreError {
     #[error("Configuration problem: {0}")]
     Config(String),
 
+    /// A value the user supplied that the Base would not accept. Distinct
+    /// from `Config`: nothing is wrong with the installation, so prefixing it
+    /// with "Configuration problem" would send the reader to the wrong file.
+    #[error("{0}")]
+    Invalid(String),
+
     #[error("Could not reach Lark. Check your connection and try again.")]
     Network(#[from] reqwest::Error),
 
@@ -60,6 +66,7 @@ impl From<CoreError> for UiError {
     fn from(err: CoreError) -> Self {
         let kind = match &err {
             CoreError::Config(_) => "config",
+            CoreError::Invalid(_) => "invalid",
             CoreError::Network(_) => "network",
             CoreError::Unauthorized => "unauthorized",
             CoreError::Forbidden => "forbidden",
@@ -101,6 +108,16 @@ mod tests {
             }
             other => panic!("expected Api, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_invalid_value_does_not_read_as_a_broken_installation() {
+        // "Configuration problem: A task needs a title." sends the user to
+        // ~/.config/omsn/desktop.env for a typo they made in a text box.
+        let ui: UiError = CoreError::Invalid("A task needs a title.".into()).into();
+        assert_eq!(ui.message, "A task needs a title.");
+        assert_eq!(ui.kind, "invalid");
+        assert!(!ui.needs_login);
     }
 
     #[test]

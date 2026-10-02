@@ -17,7 +17,7 @@ use crate::auth::{self, TokenSet};
 use crate::config::AppConfig;
 use crate::error::{CoreError, Result};
 use crate::repo::{TaskPatch, TaskRepository};
-use crate::task::{Task, Viewer};
+use crate::task::{fields, Task, Viewer};
 
 const API_BASE: &str = "https://open.larksuite.com";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -110,6 +110,10 @@ impl BitableRepo {
         Ok(guard.access_token.clone())
     }
 
+    fn search_url(&self) -> String {
+        format!("{}/search", self.records_url(None))
+    }
+
     fn records_url(&self, record_id: Option<&str>) -> String {
         let base = format!(
             "{API_BASE}/open-apis/bitable/v1/apps/{}/tables/{}/records",
@@ -150,41 +154,19 @@ impl BitableRepo {
         envelope(resp.json::<Value>().await?)
     }
 
-    /// Identify the signed-in user, so ownership can be matched by open_id.
-    pub async fn whoami(&self) -> Result<Viewer> {
-        let url = format!("{API_BASE}/open-apis/authen/v1/user_info");
-        let data = self.send(self.http.get(url)).await?;
-        let open_id = data.get("open_id").and_then(Value::as_str).unwrap_or_default();
-        if open_id.is_empty() {
-            return Err(CoreError::Auth("Lark did not return an open_id".into()));
-        }
-        let name = data.get("name").and_then(Value::as_str).unwrap_or_default();
-        Ok(Viewer::new(open_id, name))
-    }
-}
-
-/// Turn one Bitable record into a `Task`, skipping rows with no id.
-fn parse_record(item: &Value) -> Option<Task> {
-    let record_id = item.get("record_id").and_then(Value::as_str)?.to_string();
-    let fields = item.get("fields").and_then(Value::as_object)?;
-    Some(Task::from_record(record_id, fields))
-}
-
-impl TaskRepository for BitableRepo {
-    async fn list_all(&self) -> Result<Vec<Task>> {
+    /// Page through a record endpoint until it stops handing back a token.
+    ///
+    /// The request is rebuilt per page rather than cloned: a `page_token`
+    /// query parameter appended to a reused builder would accumulate.
+    async fn walk_records<F>(&self, request: F) -> Result<Vec<Task>>
+    where
+        F: Fn(Option<&str>) -> reqwest::RequestBuilder,
+    {
         let mut tasks = Vec::new();
         let mut page_token: Option<String> = None;
 
         for _ in 0..MAX_PAGES {
-            let mut req = self
-                .http
-                .get(self.records_url(None))
-                .query(&[("page_size", PAGE_SIZE.to_string())]);
-            if let Some(token) = &page_token {
-                req = req.query(&[("page_token", token)]);
-            }
-
-            let data = self.send(req).await?;
+            let data = self.send(request(page_token.as_deref())).await?;
             if let Some(items) = data.get("items").and_then(Value::as_array) {
                 tasks.extend(items.iter().filter_map(parse_record));
             }
@@ -198,6 +180,86 @@ impl TaskRepository for BitableRepo {
         }
         // Ran out of page budget: return what we have rather than failing.
         Ok(tasks)
+    }
+
+    /// Identify the signed-in user, so ownership can be matched by open_id.
+    pub async fn whoami(&self) -> Result<Viewer> {
+        let url = format!("{API_BASE}/open-apis/authen/v1/user_info");
+        let data = self.send(self.http.get(url)).await?;
+        let open_id = data.get("open_id").and_then(Value::as_str).unwrap_or_default();
+        if open_id.is_empty() {
+            return Err(CoreError::Auth("Lark did not return an open_id".into()));
+        }
+        let name = data.get("name").and_then(Value::as_str).unwrap_or_default();
+        Ok(Viewer::new(open_id, name))
+    }
+}
+
+/// The `records/search` body that narrows a read to one person's rows.
+///
+/// The open_id is spelled out. Lark rejects the literal `"CurrentUser"` here
+/// with 1254018 InvalidFilter, so there is no server-side shorthand for "me".
+fn owner_filter(open_id: &str) -> Value {
+    json!({
+        "filter": {
+            "conjunction": "and",
+            "conditions": [{
+                "field_name": fields::OWNER,
+                "operator": "is",
+                "value": [open_id],
+            }],
+        }
+    })
+}
+
+/// Turn one Bitable record into a `Task`, skipping rows with no id.
+fn parse_record(item: &Value) -> Option<Task> {
+    let record_id = item.get("record_id").and_then(Value::as_str)?.to_string();
+    let fields = item.get("fields").and_then(Value::as_object)?;
+    Some(Task::from_record(record_id, fields))
+}
+
+impl TaskRepository for BitableRepo {
+    async fn list_all(&self) -> Result<Vec<Task>> {
+        self.walk_records(|page_token| {
+            let mut req = self
+                .http
+                .get(self.records_url(None))
+                .query(&[("page_size", PAGE_SIZE.to_string())]);
+            if let Some(token) = page_token {
+                req = req.query(&[("page_token", token)]);
+            }
+            req
+        })
+        .await
+    }
+
+    /// One POST that the server filters, instead of a walk of the whole table.
+    ///
+    /// `user_id_type=open_id` is not optional: it makes person cells come back
+    /// in the same namespace the filter was built from, so a returned row's
+    /// Owner id can still be matched against the viewer by `only_mine`.
+    async fn list_owned_by(&self, open_id: &str) -> Result<Vec<Task>> {
+        if open_id.trim().is_empty() {
+            // A blank value would filter on nothing and read as "no tasks".
+            return Err(CoreError::Config("Cannot read tasks without an identity".into()));
+        }
+        let body = owner_filter(open_id);
+        self.walk_records(|page_token| {
+            let mut req = self
+                .http
+                .post(self.search_url())
+                .query(&[
+                    ("page_size", PAGE_SIZE.to_string()),
+                    ("user_id_type", "open_id".to_string()),
+                ])
+                .json(&body);
+            if let Some(token) = page_token {
+                req = req.query(&[("page_token", token)]);
+            }
+            req
+        })
+        .await
     }
 
     async fn create(&self, patch: &TaskPatch) -> Result<Task> {
@@ -280,6 +342,28 @@ mod tests {
     fn record_url_targets_one_row_when_given_an_id() {
         assert!(repo().records_url(Some("rec1")).ends_with("/records/rec1"));
         assert!(repo().records_url(None).ends_with("/records"));
+    }
+
+    #[test]
+    fn the_search_endpoint_sits_under_records() {
+        assert!(repo().search_url().ends_with("/records/search"));
+    }
+
+    #[test]
+    fn the_owner_filter_names_the_person_explicitly() {
+        // "CurrentUser" is rejected with 1254018, so the id must be spelled out.
+        let body = owner_filter("ou_abc");
+        let condition = &body["filter"]["conditions"][0];
+        assert_eq!(body["filter"]["conjunction"], "and");
+        assert_eq!(condition["field_name"], fields::OWNER);
+        assert_eq!(condition["operator"], "is");
+        assert_eq!(condition["value"][0], "ou_abc");
+    }
+
+    #[tokio::test]
+    async fn a_filtered_read_without_an_identity_is_refused_not_sent() {
+        // An empty value would match nothing and render as "NOTHING ASSIGNED".
+        assert!(repo().list_owned_by("  ").await.is_err());
     }
 
     #[tokio::test]

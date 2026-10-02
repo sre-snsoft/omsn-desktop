@@ -10,6 +10,20 @@ import type { Snapshot, Task, UiError, Viewer } from './types';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/app', () => ({ getVersion: vi.fn(async () => '0.1.0') }));
+/** Rust emits `omsn://write-settled` when a write settles. The fake hands the
+ *  handler back so a test can fire the event the way Rust would. */
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn(async (_event: string, handler: () => void) => {
+    settleListeners.push(handler);
+    return () => {
+      settleListeners = settleListeners.filter((h) => h !== handler);
+    };
+  }),
+}));
+let settleListeners: Array<() => void> = [];
+function emitWriteSettled() {
+  for (const handler of [...settleListeners]) handler();
+}
 // eslint-disable-next-line import/first
 import { invoke } from '@tauri-apps/api/core';
 // eslint-disable-next-line import/first
@@ -30,6 +44,7 @@ function task(over: Partial<Task> = {}): Task {
     workstream: null,
     remarks: null,
     due_date: null,
+    completed_date: null,
     created: Date.now(),
     modified: Date.now(),
     ...over,
@@ -75,8 +90,15 @@ function signInAffordances() {
     .filter((b) => /sign in|wait/i.test(b.textContent ?? ''));
 }
 
+/** Step past the 2 s refresh floor, so a test can trigger a real refresh. */
+function skipRefreshFloor() {
+  const real = Date.now();
+  return vi.spyOn(Date, 'now').mockImplementation(() => real + 10_000);
+}
+
 beforeEach(() => {
   invokeMock.mockReset();
+  settleListeners = [];
 });
 afterEach(() => {
   cleanup();
@@ -579,12 +601,15 @@ describe('clicking a row to read a long title (R3)', () => {
       'true'
     );
 
-    // The focus handler only polls while the window really has focus.
+    // The focus handler only polls while the window really has focus, and a
+    // refresh inside the 2 s floor is dropped as a repeat of the last one.
     const focused = vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+    const clock = skipRefreshFloor();
     await act(async () => {
       window.dispatchEvent(new Event('focus'));
       await new Promise((r) => setTimeout(r, 20));
     });
+    clock.mockRestore();
     focused.mockRestore();
 
     expect(reads).toBeGreaterThan(1);
@@ -649,5 +674,372 @@ describe('version and clock (R4)', () => {
     });
     // Dragging the window must still work from the clock.
     expect(clock).toHaveAttribute('data-tauri-drag-region');
+  });
+});
+
+describe('a refresh must not cost a whole table walk (R6)', () => {
+  function signedIn(tasks: Task[], extra: Partial<Snapshot> = {}) {
+    const reads: boolean[] = [];
+    invokeMock.mockImplementation(async (cmd, args) => {
+      if (cmd === 'sign_in') return VIEWER;
+      if (cmd === 'list_my_tasks') {
+        reads.push((args as { refresh: boolean }).refresh);
+        return snapshot(tasks, extra);
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+    return reads;
+  }
+
+  it('does not start a second read for every click of the refresh button', async () => {
+    const reads = signedIn([task()]);
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Ship the OAuth flow')).toBeInTheDocument());
+
+    const clock = skipRefreshFloor();
+    const refresh = screen.getByTitle('Refresh');
+    for (let i = 0; i < 5; i += 1) fireEvent.click(refresh);
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    clock.mockRestore();
+
+    expect(
+      reads.filter(Boolean).length,
+      'five clicks must not stack five table reads'
+    ).toBe(2); // the one at sign-in, and one for the whole burst
+  });
+
+  it('does not start a read every time the window regains focus', async () => {
+    const reads = signedIn([task()]);
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Ship the OAuth flow')).toBeInTheDocument());
+
+    const focused = vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+    const clock = skipRefreshFloor();
+    await act(async () => {
+      for (let i = 0; i < 10; i += 1) window.dispatchEvent(new Event('focus'));
+      await new Promise((r) => setTimeout(r, 20));
+    });
+    clock.mockRestore();
+    focused.mockRestore();
+
+    expect(reads.filter(Boolean).length, 'alt-tabbing must not stack reads').toBe(2);
+  });
+});
+
+describe('the in-flight marker clears on the answer, not on a timer (R6-3)', () => {
+  function pendingThenSettled() {
+    let settled = false;
+    invokeMock.mockImplementation(async (cmd) => {
+      if (cmd === 'sign_in') return VIEWER;
+      if (cmd === 'update_task') {
+        settled = true;
+        return snapshot([task({ status: 'Backlog' })], { pending_ids: ['rec1'] });
+      }
+      if (cmd === 'list_my_tasks') {
+        return snapshot([task({ status: settled ? 'Backlog' : 'In Progress' })], {
+          pending_ids: settled ? [] : [],
+        });
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+  }
+
+  it('un-dims the row as soon as Rust says the write settled', async () => {
+    pendingThenSettled();
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Ship the OAuth flow')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTitle('Back to Backlog'));
+    await waitFor(() => expect(document.querySelector('.task--pending')).not.toBeNull());
+
+    // Rust emits the event the moment the PUT settles. No timer involved.
+    await act(async () => {
+      emitWriteSettled();
+      await Promise.resolve();
+    });
+
+    expect(
+      document.querySelector('.task--pending'),
+      'the row is still dimmed after Rust reported the outcome'
+    ).toBeNull();
+  });
+
+  it('still un-dims the row when the event never arrives', async () => {
+    // A missed or duplicated event must not strand a row dimmed forever.
+    pendingThenSettled();
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Ship the OAuth flow')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTitle('Back to Backlog'));
+    await waitFor(() => expect(document.querySelector('.task--pending')).not.toBeNull());
+
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 1_400));
+    });
+
+    expect(document.querySelector('.task--pending')).toBeNull();
+  });
+});
+
+describe('fixing a typo in a title (R7)', () => {
+  function signedInWith(tasks: Task[], onUpdate?: (args: unknown) => Snapshot) {
+    invokeMock.mockImplementation(async (cmd, args) => {
+      if (cmd === 'sign_in') return VIEWER;
+      if (cmd === 'list_my_tasks') return snapshot(tasks);
+      if (cmd === 'update_task') {
+        if (onUpdate) return onUpdate(args);
+        return snapshot(tasks);
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+  }
+
+  function expand(title: string) {
+    fireEvent.click(screen.getByText(title).closest('.task__body') as HTMLElement);
+  }
+
+  it('offers EDIT and DELETE only once the row is expanded', async () => {
+    signedInWith([task()]);
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Ship the OAuth flow')).toBeInTheDocument());
+
+    expect(screen.queryByText('EDIT')).toBeNull();
+    expect(screen.queryByText('DELETE')).toBeNull();
+
+    expand('Ship the OAuth flow');
+
+    expect(screen.getByText('EDIT')).toBeInTheDocument();
+    expect(screen.getByText('DELETE')).toBeInTheDocument();
+    // And the hover strip stays two buttons wide at 360px.
+    expect(document.querySelectorAll('.task__actions button')).toHaveLength(2);
+  });
+
+  it('sends only the title, so a concurrent plugin edit is not clobbered', async () => {
+    const sent: unknown[] = [];
+    signedInWith([task()], (args) => {
+      sent.push(args);
+      return snapshot([task({ title: 'Ship the OAuth flow properly' })]);
+    });
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Ship the OAuth flow')).toBeInTheDocument());
+    expand('Ship the OAuth flow');
+
+    fireEvent.click(screen.getByText('EDIT'));
+    const input = screen.getByLabelText('Task title');
+    fireEvent.change(input, { target: { value: 'Ship the OAuth flow properly' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    await waitFor(() => expect(sent).toHaveLength(1));
+    expect(sent[0]).toEqual({
+      recordId: 'rec1',
+      patch: { title: 'Ship the OAuth flow properly' },
+    });
+    await waitFor(() =>
+      expect(screen.getByText('Ship the OAuth flow properly')).toBeInTheDocument()
+    );
+  });
+
+  it('commits from the SAVE action as well as from Enter', async () => {
+    const sent: unknown[] = [];
+    signedInWith([task()], (args) => {
+      sent.push(args);
+      return snapshot([task({ title: 'renamed' })]);
+    });
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Ship the OAuth flow')).toBeInTheDocument());
+    expand('Ship the OAuth flow');
+    fireEvent.click(screen.getByText('EDIT'));
+    fireEvent.change(screen.getByLabelText('Task title'), { target: { value: 'renamed' } });
+
+    fireEvent.click(screen.getByText('SAVE'));
+
+    await waitFor(() => expect(sent).toHaveLength(1));
+  });
+
+  it('abandons the edit on Escape and on CANCEL, with nothing sent', async () => {
+    const sent: unknown[] = [];
+    signedInWith([task()], (args) => {
+      sent.push(args);
+      return snapshot([task()]);
+    });
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Ship the OAuth flow')).toBeInTheDocument());
+    expand('Ship the OAuth flow');
+
+    fireEvent.click(screen.getByText('EDIT'));
+    fireEvent.change(screen.getByLabelText('Task title'), { target: { value: 'typo' } });
+    fireEvent.keyDown(screen.getByLabelText('Task title'), { key: 'Escape' });
+
+    expect(screen.queryByLabelText('Task title')).toBeNull();
+    expect(screen.getByText('Ship the OAuth flow')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('EDIT'));
+    fireEvent.change(screen.getByLabelText('Task title'), { target: { value: 'typo again' } });
+    fireEvent.click(screen.getByText('CANCEL'));
+
+    expect(screen.queryByLabelText('Task title')).toBeNull();
+    expect(sent, 'cancelling must not write').toHaveLength(0);
+  });
+
+  it('does not collapse the row while the input has focus', async () => {
+    signedInWith([task()]);
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Ship the OAuth flow')).toBeInTheDocument());
+    expand('Ship the OAuth flow');
+    fireEvent.click(screen.getByText('EDIT'));
+
+    const input = screen.getByLabelText('Task title');
+    fireEvent.click(input);
+    fireEvent.keyDown(input, { key: ' ' });
+
+    expect(
+      screen.queryByLabelText('Task title'),
+      'the row-expand handler fired and closed the editor'
+    ).not.toBeNull();
+  });
+
+  it('refuses a blank title, says why, and does not lose the original', async () => {
+    const refusal: UiError = {
+      kind: 'invalid',
+      message: 'A task needs a title.',
+      needs_login: false,
+    };
+    invokeMock.mockImplementation(async (cmd) => {
+      if (cmd === 'sign_in') return VIEWER;
+      if (cmd === 'list_my_tasks') return snapshot([task()]);
+      if (cmd === 'update_task') throw refusal;
+      throw new Error(`unexpected ${cmd}`);
+    });
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Ship the OAuth flow')).toBeInTheDocument());
+    expand('Ship the OAuth flow');
+
+    fireEvent.click(screen.getByText('EDIT'));
+    fireEvent.change(screen.getByLabelText('Task title'), { target: { value: '   ' } });
+    fireEvent.keyDown(screen.getByLabelText('Task title'), { key: 'Enter' });
+
+    await waitFor(() => expect(screen.getByText(/A task needs a title/)).toBeInTheDocument());
+    expect(
+      screen.getByLabelText('Task title'),
+      'the editor must stay open on the refused text'
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('CANCEL'));
+    expect(screen.getByText('Ship the OAuth flow')).toBeInTheDocument();
+  });
+});
+
+describe('deleting a task (R7)', () => {
+  function signedIn(onDelete?: () => Snapshot) {
+    const deletes: unknown[] = [];
+    invokeMock.mockImplementation(async (cmd, args) => {
+      if (cmd === 'sign_in') return VIEWER;
+      if (cmd === 'list_my_tasks') return snapshot([task()]);
+      if (cmd === 'delete_task') {
+        deletes.push(args);
+        if (onDelete) return onDelete();
+        return snapshot([]);
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+    return deletes;
+  }
+
+  async function openConfirm() {
+    render(<App />);
+    await waitFor(() => expect(screen.getByText('Ship the OAuth flow')).toBeInTheDocument());
+    fireEvent.click(screen.getByText('Ship the OAuth flow').closest('.task__body') as HTMLElement);
+    fireEvent.click(screen.getByText('DELETE'));
+    return document.querySelector('.confirm') as HTMLElement;
+  }
+
+  it('asks first, and says the deletion cannot be undone', async () => {
+    const deletes = signedIn();
+    const confirm = await openConfirm();
+
+    expect(confirm).not.toBeNull();
+    expect(screen.getByText(/cannot be undone/i)).toBeInTheDocument();
+    expect(confirm.textContent, 'the confirm must name the task').toContain(
+      'Ship the OAuth flow'
+    );
+    expect(screen.getAllByText('Ship the OAuth flow').length).toBeGreaterThan(0);
+    expect(deletes, 'nothing may be deleted before the confirm is answered').toHaveLength(0);
+  });
+
+  it('does not dress the destructive button up as the safe one', async () => {
+    // Muscle memory from MARK AS DONE? -> YES must not destroy a record.
+    signedIn();
+    const confirm = await openConfirm();
+    const destructive = Array.from(confirm.querySelectorAll('button')).find(
+      (b) => b.textContent === 'DELETE'
+    ) as HTMLButtonElement;
+
+    expect(destructive.className).toContain('pixel-btn--danger');
+    expect(destructive.className).not.toContain('pixel-btn--ok');
+    expect(confirm.textContent).not.toContain('YES');
+    expect(document.activeElement?.textContent, 'focus must start on the way out').toBe(
+      'CANCEL'
+    );
+  });
+
+  it('cancels from the backdrop and from Escape', async () => {
+    const deletes = signedIn();
+    const confirm = await openConfirm();
+
+    fireEvent.click(confirm);
+    expect(document.querySelector('.confirm')).toBeNull();
+
+    fireEvent.click(screen.getByText('DELETE'));
+    expect(document.querySelector('.confirm')).not.toBeNull();
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(document.querySelector('.confirm')).toBeNull());
+
+    expect(deletes).toHaveLength(0);
+    expect(screen.getByText('Ship the OAuth flow')).toBeInTheDocument();
+  });
+
+  it('removes the row once the Base has confirmed it', async () => {
+    const deletes = signedIn();
+    const confirm = await openConfirm();
+
+    fireEvent.click(
+      Array.from(confirm.querySelectorAll('button')).find(
+        (b) => b.textContent === 'DELETE'
+      ) as HTMLButtonElement
+    );
+
+    await waitFor(() => expect(deletes).toHaveLength(1));
+    expect(deletes[0]).toEqual({ recordId: 'rec1' });
+    await waitFor(() => expect(screen.queryByText('Ship the OAuth flow')).toBeNull());
+    expect(screen.getByText(/NOTHING ASSIGNED/i)).toBeInTheDocument();
+  });
+
+  it('puts the row back and says why when the Base refuses', async () => {
+    const refusal: UiError = {
+      kind: 'forbidden',
+      message: 'You do not have permission to do that in this Base.',
+      needs_login: false,
+    };
+    invokeMock.mockImplementation(async (cmd) => {
+      if (cmd === 'sign_in') return VIEWER;
+      if (cmd === 'list_my_tasks') return snapshot([task()]);
+      if (cmd === 'delete_task') throw refusal;
+      throw new Error(`unexpected ${cmd}`);
+    });
+    const confirm = await openConfirm();
+
+    fireEvent.click(
+      Array.from(confirm.querySelectorAll('button')).find(
+        (b) => b.textContent === 'DELETE'
+      ) as HTMLButtonElement
+    );
+
+    await waitFor(() => expect(screen.getByText(/do not have permission/)).toBeInTheDocument());
+    expect(
+      screen.getByText('Ship the OAuth flow'),
+      'a refused delete must not leave the row vanished'
+    ).toBeInTheDocument();
   });
 });

@@ -19,6 +19,10 @@ pub mod fields {
     pub const WORKSTREAM: &str = "Workstream";
     pub const REMARKS: &str = "Remarks";
     pub const DUE_DATE: &str = "Due Date";
+    /// Datetime (`yyyy/MM/dd`), stamped by whoever marks a task Done.
+    /// `Completed Month` is a formula over this field, so leaving it blank
+    /// leaves the month blank too — honest, and better than a wrong date.
+    pub const COMPLETED_DATE: &str = "Completed Date";
     pub const CREATED: &str = "Created";
     pub const MODIFIED: &str = "Modified";
 }
@@ -108,6 +112,10 @@ pub struct Task {
     pub workstream: Option<String>,
     pub remarks: Option<String>,
     pub due_date: Option<i64>,
+    /// The day the work was finished, set when a client writes `Done`.
+    /// Blank for anything completed in the Lark UI by hand, and for every
+    /// record that predates this field — neither is guessed at.
+    pub completed_date: Option<i64>,
     pub created: Option<i64>,
     pub modified: Option<i64>,
 }
@@ -177,6 +185,7 @@ impl Task {
             workstream: scalar(f.get(fields::WORKSTREAM)),
             remarks: scalar(f.get(fields::REMARKS)),
             due_date: epoch_millis(f.get(fields::DUE_DATE)),
+            completed_date: epoch_millis(f.get(fields::COMPLETED_DATE)),
             created: epoch_millis(f.get(fields::CREATED)),
             modified: epoch_millis(f.get(fields::MODIFIED)),
         }
@@ -272,6 +281,22 @@ mod tests {
         assert_eq!(t.title, "(untitled)");
         assert_eq!(t.status, "Backlog");
         assert!(t.owners.is_empty());
+    }
+
+    #[test]
+    fn reads_a_completed_date_when_the_base_has_one() {
+        let f = fields_of(json!({"Status": "Done", "Completed Date": 1_760_000_000_000i64}));
+        assert_eq!(
+            Task::from_record("r".into(), &f).completed_date,
+            Some(1_760_000_000_000)
+        );
+    }
+
+    #[test]
+    fn a_task_completed_by_hand_in_lark_has_no_completion_date() {
+        // Expected, not a bug: nothing may invent a date the Base does not hold.
+        let f = fields_of(json!({"Status": "Done"}));
+        assert_eq!(Task::from_record("r".into(), &f).completed_date, None);
     }
 
     #[test]

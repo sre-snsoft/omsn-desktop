@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { Task } from './types';
 import { STATUS_CLASS, STATUS_ICON, daysSince, isStale } from './types';
 
@@ -10,6 +10,9 @@ const ADVANCE: Record<string, string> = {
   'On Hold': 'In Progress',
 };
 
+/** Matches the add bar, and the Base's own Title column. */
+const TITLE_MAX = 200;
+
 export function TaskRow({
   task,
   pending,
@@ -17,6 +20,8 @@ export function TaskRow({
   onToggleExpand,
   onSetStatus,
   onAskDone,
+  onRename,
+  onAskDelete,
 }: {
   task: Task;
   pending: boolean;
@@ -24,11 +29,32 @@ export function TaskRow({
   onToggleExpand: (recordId: string) => void;
   onSetStatus: (task: Task, status: string) => void;
   onAskDone: (task: Task) => void;
+  /** Resolves false when the Base refused the new title, so the editor can
+   *  stay open on the text the user typed rather than discarding it. */
+  onRename: (task: Task, title: string) => Promise<boolean>;
+  onAskDelete: (task: Task) => void;
 }) {
   const age = daysSince(task.modified ?? task.created);
   const stale = isStale(task);
   const inProgress = task.status === 'In Progress';
   const body = useRef<HTMLDivElement>(null);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(task.title);
+
+  // Collapsing the row abandons the edit. Nothing is sent: clicking away from
+  // a half-typed title must not commit it.
+  useEffect(() => {
+    if (!expanded) setEditing(false);
+  }, [expanded]);
+
+  const startEditing = () => {
+    setDraft(task.title);
+    setEditing(true);
+  };
+
+  const commit = async () => {
+    if (await onRename(task, draft)) setEditing(false);
+  };
 
   // A row taller than the page would otherwise expand below the fold. The
   // list scrolls, so bring the row the user just opened back into view.
@@ -73,12 +99,31 @@ export function TaskRow({
           onToggleExpand(task.record_id);
         }}
       >
-        <span
-          className={`task__title ${expanded ? 'task__title--expanded' : ''}`}
-          title={expanded ? undefined : task.title}
-        >
-          {task.title}
-        </span>
+        {editing ? (
+          <input
+            className="task__rename"
+            value={draft}
+            maxLength={TITLE_MAX}
+            aria-label="Task title"
+            autoFocus
+            onChange={(e) => setDraft(e.target.value)}
+            // The row's own click and Enter/Space handlers would otherwise
+            // collapse the row out from under the input being typed into.
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === 'Enter') void commit();
+              if (e.key === 'Escape') setEditing(false);
+            }}
+          />
+        ) : (
+          <span
+            className={`task__title ${expanded ? 'task__title--expanded' : ''}`}
+            title={expanded ? undefined : task.title}
+          >
+            {task.title}
+          </span>
+        )}
         <span className="task__meta">
           {task.priority && (
             <span className={`chip chip--${task.priority.slice(0, 2).toLowerCase()}`}>
@@ -121,6 +166,40 @@ export function TaskRow({
           </button>
         )}
       </div>
+
+      {/* Editing and deleting live here rather than in the hover strip: four
+          buttons do not fit a 360px window, and an irreversible delete must
+          not sit beside the complete marker. Expanding is already a
+          deliberate click, so each is two intentional actions away. */}
+      {expanded && (
+        <div className="task__drawer">
+          {editing ? (
+            <>
+              <button className="pixel-btn" onClick={() => void commit()}>
+                SAVE
+              </button>
+              <button
+                className="pixel-btn pixel-btn--ghost"
+                onClick={() => setEditing(false)}
+              >
+                CANCEL
+              </button>
+            </>
+          ) : (
+            <>
+              <button className="pixel-btn pixel-btn--ghost" onClick={startEditing}>
+                EDIT
+              </button>
+              <button
+                className="pixel-btn pixel-btn--danger"
+                onClick={() => onAskDelete(task)}
+              >
+                DELETE
+              </button>
+            </>
+          )}
+        </div>
+      )}
     </li>
   );
 }

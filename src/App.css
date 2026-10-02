@@ -238,6 +238,7 @@ button {
 .task {
   position: relative; /* the action buttons are laid over the row */
   display: flex;
+  flex-wrap: wrap; /* the expanded drawer takes a line of its own */
   gap: 10px;
   align-items: flex-start;
   padding: 12px 10px;
@@ -315,6 +316,39 @@ button {
   text-overflow: clip;
   white-space: normal;
   overflow-wrap: break-word;
+}
+
+/* The title, swapped for an input while a typo is being fixed. Sized to the
+   row it replaces so nothing shifts when editing starts. */
+.task__rename {
+  width: 100%;
+  padding: 6px;
+  font: inherit;
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--text);
+  background: var(--panel);
+  border: 2px solid var(--accent);
+}
+
+.task__rename:focus {
+  outline: none;
+  border-color: var(--accent-bright);
+}
+
+/* Edit and delete, in the expanded row rather than the hover strip: four
+   buttons do not fit a 360px window, and delete must not sit beside the
+   complete marker. */
+.task__drawer {
+  flex: 1 1 100%;
+  display: flex;
+  gap: 6px;
+  padding-top: 4px;
+}
+
+.task__drawer button {
+  padding: 6px 8px;
+  font-size: 8px;
 }
 
 .task__meta {
@@ -437,6 +471,15 @@ button {
   line-height: 1.9;
   margin-bottom: 16px;
   word-break: break-word;
+}
+
+/* Spells out that there is no undo. The destructive button is coloured
+   --danger and never reuses the --ok treatment of MARK AS DONE?. */
+.confirm__warn {
+  color: var(--danger);
+  font-size: 8px;
+  line-height: 1.9;
+  margin-bottom: 16px;
 }
 
 .confirm__row {

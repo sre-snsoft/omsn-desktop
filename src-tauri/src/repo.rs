@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 
+use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -26,6 +27,38 @@ pub struct TaskPatch {
     pub remarks: Option<String>,
     /// Owner writes as a list of open_ids, not the `{id, name}` objects it reads as.
     pub owner_ids: Option<Vec<String>>,
+    /// Epoch milliseconds. A Bitable datetime rejects a formatted string
+    /// (1254064), so the day is carried as an instant and rendered by the Base.
+    pub completed_date: Option<i64>,
+}
+
+/// The instant to stamp on a task being marked Done.
+///
+/// Noon rather than midnight on purpose: a Bitable datetime is an absolute
+/// instant that the Base renders in *its own* timezone, so a midnight stamp
+/// lands on the previous day for anyone a few hours west of it. Noon survives
+/// a twelve-hour disagreement in either direction.
+pub fn completion_stamp_millis(now: DateTime<Local>) -> i64 {
+    let noon = now.date_naive().and_hms_opt(12, 0, 0).expect("12:00 exists on every day");
+    noon.and_local_timezone(*now.offset())
+        .single()
+        .map(|t| t.timestamp_millis())
+        .unwrap_or_else(|| now.timestamp_millis())
+}
+
+/// Stamp the completion day onto a patch that marks a task Done.
+///
+/// Returns a new patch; the input is untouched. Only a Done write carries a
+/// date, and the value is decided here rather than in the webview — the UI
+/// does not get to choose when a task was finished. A patch that does not
+/// set Done leaves the field absent, so an unrelated edit to a Done row never
+/// re-stamps it. That re-stamping was the original defect.
+pub fn stamp_completion(patch: TaskPatch, now: DateTime<Local>) -> TaskPatch {
+    let completing = patch.status.as_deref() == Some(status::DONE);
+    TaskPatch {
+        completed_date: completing.then(|| completion_stamp_millis(now)),
+        ..patch
+    }
 }
 
 impl TaskPatch {
@@ -37,7 +70,7 @@ impl TaskPatch {
     pub fn validate(&self) -> Result<()> {
         if let Some(v) = &self.status {
             if !status::is_valid(v) {
-                return Err(CoreError::Config(format!(
+                return Err(CoreError::Invalid(format!(
                     "\"{v}\" is not a valid status. Expected one of: {}",
                     status::ALL.join(", ")
                 )));
@@ -45,7 +78,7 @@ impl TaskPatch {
         }
         if let Some(v) = &self.priority {
             if !priority::is_valid(v) {
-                return Err(CoreError::Config(format!(
+                return Err(CoreError::Invalid(format!(
                     "\"{v}\" is not a valid priority. Expected one of: {}",
                     priority::ALL.join(", ")
                 )));
@@ -53,7 +86,7 @@ impl TaskPatch {
         }
         if let Some(t) = &self.title {
             if t.trim().is_empty() {
-                return Err(CoreError::Config("A task needs a title.".into()));
+                return Err(CoreError::Invalid("A task needs a title.".into()));
             }
         }
         Ok(())
@@ -65,6 +98,7 @@ impl TaskPatch {
             && self.priority.is_none()
             && self.remarks.is_none()
             && self.owner_ids.is_none()
+            && self.completed_date.is_none()
     }
 
     /// Render to the Lark `fields` map, omitting anything untouched.
@@ -92,6 +126,9 @@ impl TaskPatch {
                 .collect();
             out.insert(fields::OWNER.to_string(), Value::Array(people));
         }
+        if let Some(millis) = self.completed_date {
+            out.insert(fields::COMPLETED_DATE.to_string(), Value::Number(millis.into()));
+        }
         out
     }
 
@@ -110,12 +147,24 @@ impl TaskPatch {
         if let Some(v) = &self.remarks {
             next.remarks = Some(v.clone());
         }
+        if let Some(millis) = self.completed_date {
+            next.completed_date = Some(millis);
+        }
         next
     }
 }
 
 pub trait TaskRepository: Send + Sync {
+    /// Every record in the table. Still here after the server-side filter
+    /// landed: it is what the sign-in cross-check compares against, what the
+    /// fallback path uses, and what a future team view would need.
     fn list_all(&self) -> impl Future<Output = Result<Vec<Task>>> + Send;
+
+    /// Only the records the given person owns, filtered by the server.
+    ///
+    /// A parameter rather than a constant so this is an optimisation of the
+    /// fetch, not a second access rule. `only_mine` remains the access gate.
+    fn list_owned_by(&self, open_id: &str) -> impl Future<Output = Result<Vec<Task>>> + Send;
     fn create(&self, patch: &TaskPatch) -> impl Future<Output = Result<Task>> + Send;
     fn update(&self, record_id: &str, patch: &TaskPatch)
         -> impl Future<Output = Result<Task>> + Send;
@@ -193,6 +242,84 @@ mod tests {
     }
 
     #[test]
+    fn a_done_write_carries_the_day_it_was_completed() {
+        let patch = TaskPatch { status: Some("Done".into()), ..Default::default() };
+        let stamped = stamp_completion(patch.clone(), fixed_now());
+
+        assert!(patch.completed_date.is_none(), "the input must be untouched");
+        let f = stamped.to_fields();
+        assert_eq!(f.len(), 2, "status and the completion date, nothing else");
+        assert_eq!(
+            f.get(fields::COMPLETED_DATE).and_then(Value::as_i64),
+            Some(completion_stamp_millis(fixed_now()))
+        );
+    }
+
+    #[test]
+    fn editing_another_field_on_a_done_row_does_not_restamp_it() {
+        // The defect this field exists to fix: `Completed Month` used to be
+        // derived from `Modified`, so any later touch moved it.
+        let patch = TaskPatch { remarks: Some("picked back up".into()), ..Default::default() };
+        let stamped = stamp_completion(patch, fixed_now());
+
+        assert!(stamped.completed_date.is_none());
+        assert!(!stamped.to_fields().contains_key(fields::COMPLETED_DATE));
+    }
+
+    #[test]
+    fn moving_a_task_off_done_leaves_the_recorded_day_alone() {
+        // Absent from the patch means absent from the request, so the Base
+        // keeps what it has: last completion wins, never cleared.
+        let patch = TaskPatch { status: Some("In Progress".into()), ..Default::default() };
+        assert!(stamp_completion(patch, fixed_now()).completed_date.is_none());
+    }
+
+    #[test]
+    fn the_webview_does_not_get_to_choose_the_completion_day() {
+        let forged = TaskPatch {
+            status: Some("Done".into()),
+            completed_date: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            stamp_completion(forged, fixed_now()).completed_date,
+            Some(completion_stamp_millis(fixed_now())),
+            "the day is decided in Rust, not supplied by the UI"
+        );
+    }
+
+    #[test]
+    fn the_completion_stamp_lands_at_midday_on_the_right_day() {
+        let now = fixed_now();
+        let stamped = DateTime::from_timestamp_millis(completion_stamp_millis(now))
+            .unwrap()
+            .with_timezone(&now.timezone());
+        assert_eq!(stamped.date_naive(), now.date_naive());
+        assert_eq!(stamped.time().to_string(), "12:00:00");
+    }
+
+    #[test]
+    fn a_completion_date_writes_as_epoch_millis_not_a_string() {
+        // A Bitable datetime rejects a formatted string with 1254064.
+        let patch = TaskPatch { completed_date: Some(1_760_000_000_000), ..Default::default() };
+        assert!(patch.to_fields()[fields::COMPLETED_DATE].is_number());
+    }
+
+    #[test]
+    fn a_blank_title_reads_as_a_user_mistake_not_a_broken_install() {
+        let patch = TaskPatch { title: Some(" ".into()), ..Default::default() };
+        let err = patch.validate().unwrap_err();
+        assert!(matches!(err, CoreError::Invalid(_)), "got {err:?}");
+        assert_eq!(err.to_string(), "A task needs a title.");
+    }
+
+    /// A stable instant with a real timezone offset, so the stamp can be
+    /// asserted without depending on where the test runs.
+    fn fixed_now() -> DateTime<Local> {
+        DateTime::from_timestamp(1_760_000_000, 0).unwrap().with_timezone(&Local)
+    }
+
+    #[test]
     fn a_patch_that_touches_nothing_validates() {
         assert!(TaskPatch::default().validate().is_ok());
     }
@@ -209,6 +336,7 @@ mod tests {
             workstream: None,
             remarks: None,
             due_date: None,
+            completed_date: None,
             created: None,
             modified: None,
         };

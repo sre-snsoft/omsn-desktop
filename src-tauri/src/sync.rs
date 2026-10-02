@@ -51,6 +51,27 @@ pub struct WriteFailure {
     pub message: String,
 }
 
+/// How a poll reads the Base.
+///
+/// The server-side Owner filter is an optimisation of the *fetch*; `only_mine`
+/// remains the access gate either way. Which one a session uses is decided
+/// once, by the sign-in cross-check, and never guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum FetchMode {
+    /// One POST to `records/search` with an explicit `open_id` condition.
+    Filtered,
+    /// The whole table, narrowed by `only_mine`. Slower, and always correct.
+    FullWalk,
+}
+
+/// A walk that is under way. Carrying the time the fetch *began* is what lets
+/// `apply_poll` tell a fresh result from one that left before the data the
+/// store already holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollStart {
+    pub started_at_millis: i64,
+}
+
 /// How long to keep believing a pending write before giving up on it.
 pub const PENDING_TIMEOUT_MILLIS: i64 = 60_000;
 
@@ -82,6 +103,15 @@ pub struct Store<R: TaskRepository> {
     next_seq: u64,
     fetched_at_millis: i64,
     stale: bool,
+    fetch_mode: FetchMode,
+    /// The walk currently in flight, by the time it began. `None` means no
+    /// walk is running, which is the only state a new one may start from.
+    in_flight_poll: Option<PollStart>,
+    /// A walk that began at or before this instant left before a write we
+    /// have since settled, so its rows are pre-write and must be discarded.
+    stale_poll_barrier: i64,
+    /// The start time of the walk whose data is on screen now.
+    last_applied_start: i64,
 }
 
 impl<R: TaskRepository> Store<R> {
@@ -94,6 +124,51 @@ impl<R: TaskRepository> Store<R> {
             next_seq: 1,
             fetched_at_millis: 0,
             stale: false,
+            // Until the cross-check proves the server filter sees every row
+            // the viewer owns, the slow path is the correct one.
+            fetch_mode: FetchMode::FullWalk,
+            in_flight_poll: None,
+            stale_poll_barrier: i64::MIN,
+            last_applied_start: i64::MIN,
+        }
+    }
+
+    pub fn fetch_mode(&self) -> FetchMode {
+        self.fetch_mode
+    }
+
+    pub fn set_fetch_mode(&mut self, mode: FetchMode) {
+        self.fetch_mode = mode;
+    }
+
+    /// Claim the right to walk the Base, or refuse because one already is.
+    ///
+    /// Three unthrottled triggers start a refresh — the interval timer, the
+    /// window focus listener and the refresh button — and an always-on-top
+    /// widget is alt-tabbed constantly. Without this, each stacks a new walk.
+    pub fn begin_poll(&mut self, started_at_millis: i64) -> Option<PollStart> {
+        if self.in_flight_poll.is_some() {
+            return None;
+        }
+        let start = PollStart { started_at_millis };
+        self.in_flight_poll = Some(start);
+        Some(start)
+    }
+
+    /// Release the claim, whatever the walk returned.
+    pub fn end_poll(&mut self) {
+        self.in_flight_poll = None;
+    }
+
+    /// Mark whatever walk is in flight as predating a change we just made.
+    ///
+    /// It left before the write landed, so its answer describes the record as
+    /// it was. Applying it would revert the user's change *after* the overlay
+    /// that protected it has already been retired — nothing is left to catch
+    /// it, which is what made this so hard to see.
+    fn bar_polls_older_than_now(&mut self) {
+        if let Some(start) = self.in_flight_poll {
+            self.stale_poll_barrier = self.stale_poll_barrier.max(start.started_at_millis);
         }
     }
 
@@ -127,11 +202,25 @@ impl<R: TaskRepository> Store<R> {
     }
 
     /// Fold a completed poll in and retire any pending write it confirms.
-    pub fn apply_poll(&mut self, tasks: Vec<Task>, now_millis: i64) {
+    ///
+    /// Returns false when the result is older than what the store already
+    /// holds. That is a normal outcome, not an error: the rows are dropped
+    /// and the previous snapshot — and its `fetched_at_millis` — stand.
+    /// Stamping stale rows with a newer time was the defect; it left the
+    /// store holding pre-write data labelled fresh, which also released the
+    /// UI pin and jumped the row the user had just touched.
+    pub fn apply_poll(&mut self, tasks: Vec<Task>, poll: PollStart, now_millis: i64) -> bool {
+        if poll.started_at_millis <= self.stale_poll_barrier
+            || poll.started_at_millis < self.last_applied_start
+        {
+            return false;
+        }
         self.polled = tasks;
         self.fetched_at_millis = now_millis;
+        self.last_applied_start = poll.started_at_millis;
         self.stale = false;
         self.retire_confirmed(now_millis);
+        true
     }
 
     /// A failed refresh keeps the previous snapshot and flags it stale: showing
@@ -209,6 +298,8 @@ impl<R: TaskRepository> Store<R> {
     /// waiting for the next tick. On failure the overlay goes and the row
     /// snaps back to the server's value, with the reason kept for the UI.
     pub fn settle_update(&mut self, record_id: &str, seq: u64, outcome: Result<Task>) {
+        self.bar_polls_older_than_now();
+
         // A later click already replaced this overlay. Its own completion owns
         // the overlay now, so only the server record is worth keeping.
         let still_ours = self.pending.get(record_id).map(|p| p.seq) == Some(seq);
@@ -242,17 +333,30 @@ impl<R: TaskRepository> Store<R> {
         }
     }
 
-    pub async fn create(&mut self, patch: TaskPatch) -> Result<Task> {
-        let created = self.repo.create(&patch).await?;
-        self.polled.push(created.clone());
-        Ok(created)
+    /// Fold a record the Base has just created into the snapshot.
+    ///
+    /// Deliberately not async: the POST happens in `store_cell`, with the
+    /// store lock released. Holding the lock across it was the surviving half
+    /// of the R5 bug.
+    pub fn fold_created(&mut self, created: Task) {
+        self.bar_polls_older_than_now();
+        self.polled.push(created);
     }
 
-    pub async fn delete(&mut self, record_id: &str) -> Result<()> {
-        self.repo.delete(record_id).await?;
+    /// Drop a record the Base has just deleted, and any overlay on it.
+    pub fn fold_deleted(&mut self, record_id: &str) {
+        self.bar_polls_older_than_now();
         self.polled.retain(|t| t.record_id != record_id);
         self.pending.remove(record_id);
-        Ok(())
+    }
+
+    /// Whether this viewer owns `record_id`, as far as the last poll knows.
+    ///
+    /// `None` means the store has never seen the record. The caller must
+    /// refuse that too: an id the store cannot vouch for is an id that must
+    /// not be written to.
+    pub fn ownership_of(&self, record_id: &str, viewer: &Viewer) -> Option<bool> {
+        self.polled.iter().find(|t| t.record_id == record_id).map(|t| t.is_owned_by(viewer))
     }
 }
 
@@ -265,6 +369,7 @@ fn merge_patches(base: &TaskPatch, next: &TaskPatch) -> TaskPatch {
         priority: next.priority.clone().or_else(|| base.priority.clone()),
         remarks: next.remarks.clone().or_else(|| base.remarks.clone()),
         owner_ids: next.owner_ids.clone().or_else(|| base.owner_ids.clone()),
+        completed_date: next.completed_date.or(base.completed_date),
     }
 }
 
@@ -277,8 +382,13 @@ mod tests {
     /// The locking and background-write rules live in `store_cell`.
     fn seeded(tasks: Vec<Task>) -> Store<FakeRepo> {
         let mut store = Store::new(FakeRepo::with(tasks.clone()));
-        store.apply_poll(tasks, 1_000);
+        store.apply_poll(tasks, walk_from(900), 1_000);
         store
+    }
+
+    /// A walk that began at `started_at_millis`.
+    fn walk_from(started_at_millis: i64) -> PollStart {
+        PollStart { started_at_millis }
     }
 
     #[test]
@@ -331,7 +441,7 @@ mod tests {
         store.begin_update("rec_a", status_patch("In Progress"), 1_000).unwrap();
 
         // A poll returns the pre-write snapshot (Modified unchanged).
-        store.apply_poll(vec![task_named("a", "ou_me")], 2_000);
+        store.apply_poll(vec![task_named("a", "ou_me")], walk_from(1_900), 2_000);
 
         let snap = store.snapshot(&me());
         assert_eq!(
@@ -349,7 +459,7 @@ mod tests {
         let mut landed = task_named("a", "ou_me");
         landed.status = "In Progress".into();
         landed.modified = Some(2_000);
-        store.apply_poll(vec![landed], 3_000);
+        store.apply_poll(vec![landed], walk_from(2_900), 3_000);
 
         assert!(store.snapshot(&me()).pending_ids.is_empty(), "overlay should be retired");
     }
@@ -359,7 +469,11 @@ mod tests {
         let mut store = seeded(vec![task_named("a", "ou_me")]);
         store.begin_update("rec_a", status_patch("In Progress"), 0).unwrap();
 
-        store.apply_poll(vec![task_named("a", "ou_me")], PENDING_TIMEOUT_MILLIS + 1);
+        store.apply_poll(
+            vec![task_named("a", "ou_me")],
+            walk_from(PENDING_TIMEOUT_MILLIS),
+            PENDING_TIMEOUT_MILLIS + 1,
+        );
 
         assert!(
             store.snapshot(&me()).pending_ids.is_empty(),
@@ -452,7 +566,7 @@ mod tests {
         let seq = store.begin_update("rec_a", status_patch("Done"), 1_000).unwrap();
         store.settle_update("rec_a", seq, Err(CoreError::Forbidden));
 
-        store.apply_poll(vec![task_named("a", "ou_me")], 1_001);
+        store.apply_poll(vec![task_named("a", "ou_me")], walk_from(1_000), 1_001);
 
         let snap = store.snapshot(&me());
         assert_eq!(snap.write_failures.len(), 1, "the user must still be told");
@@ -480,15 +594,131 @@ mod tests {
         assert_eq!(snap.fetched_at_millis, 1_000, "timestamp is of the last good fetch");
     }
 
-    #[tokio::test]
-    async fn delete_removes_the_task_and_any_overlay() {
+    #[test]
+    fn delete_removes_the_task_and_any_overlay() {
         let mut store = seeded(vec![task_named("a", "ou_me")]);
         store.begin_update("rec_a", status_patch("Done"), 1_000).unwrap();
-        store.delete("rec_a").await.unwrap();
+        store.fold_deleted("rec_a");
 
         let snap = store.snapshot(&me());
         assert!(snap.tasks.is_empty());
         assert!(snap.pending_ids.is_empty());
+    }
+
+    // ---- R6-2: a poll may never be applied over newer data ----
+
+    #[test]
+    fn only_one_walk_may_be_in_flight_at_a_time() {
+        let mut store = seeded(vec![task_named("a", "ou_me")]);
+        assert!(store.begin_poll(2_000).is_some());
+        assert!(
+            store.begin_poll(2_100).is_none(),
+            "the focus listener and the refresh button must not stack walks"
+        );
+        store.end_poll();
+        assert!(store.begin_poll(2_200).is_some(), "the next walk may start once it is free");
+    }
+
+    #[test]
+    fn a_walk_that_started_first_cannot_overwrite_one_that_started_later() {
+        // Poll A leaves, poll B leaves, B returns first, A returns second.
+        // A's rows are older but would carry the later timestamp.
+        let mut store = seeded(vec![task_named("a", "ou_me")]);
+        let a = walk_from(2_000);
+        let b = walk_from(2_100);
+
+        let mut newer = task_named("a", "ou_me");
+        newer.status = "In Progress".into();
+        newer.modified = Some(5_000);
+        assert!(store.apply_poll(vec![newer], b, 3_000));
+
+        let applied = store.apply_poll(vec![task_named("a", "ou_me")], a, 4_000);
+
+        assert!(!applied, "an older walk must be discarded, not applied");
+        let snap = store.snapshot(&me());
+        assert_eq!(snap.tasks[0].status, "In Progress", "the newer rows must survive");
+        assert_eq!(
+            snap.fetched_at_millis, 3_000,
+            "a discarded walk must not stamp stale rows as freshly fetched"
+        );
+    }
+
+    #[test]
+    fn a_walk_that_left_before_a_write_settled_is_discarded() {
+        // The revert the user sees: the overlay is already retired by the
+        // time the pre-write rows arrive, so nothing else protects them.
+        let mut store = seeded(vec![task_named("a", "ou_me")]);
+        let in_flight = store.begin_poll(2_000).expect("free to walk");
+
+        let seq = store.begin_update("rec_a", status_patch("In Progress"), 2_100).unwrap();
+        let mut confirmed = task_named("a", "ou_me");
+        confirmed.status = "In Progress".into();
+        confirmed.modified = Some(2_500);
+        store.settle_update("rec_a", seq, Ok(confirmed));
+        assert!(store.snapshot(&me()).pending_ids.is_empty(), "the overlay is gone");
+
+        store.end_poll();
+        let applied = store.apply_poll(vec![task_named("a", "ou_me")], in_flight, 3_000);
+
+        assert!(!applied);
+        assert_eq!(
+            store.snapshot(&me()).tasks[0].status,
+            "In Progress",
+            "the settled write must not be reverted by a walk that predates it"
+        );
+    }
+
+    #[test]
+    fn a_walk_that_left_after_the_write_settled_is_applied_normally() {
+        let mut store = seeded(vec![task_named("a", "ou_me")]);
+        let seq = store.begin_update("rec_a", status_patch("In Progress"), 2_000).unwrap();
+        let mut confirmed = task_named("a", "ou_me");
+        confirmed.status = "In Progress".into();
+        confirmed.modified = Some(2_500);
+        store.settle_update("rec_a", seq, Ok(confirmed.clone()));
+
+        let fresh = store.begin_poll(3_000).unwrap();
+        store.end_poll();
+        assert!(store.apply_poll(vec![confirmed], fresh, 3_500), "a fresh walk still lands");
+        assert_eq!(store.snapshot(&me()).fetched_at_millis, 3_500);
+    }
+
+    #[test]
+    fn a_walk_in_flight_when_a_row_is_deleted_cannot_resurrect_it() {
+        let mut store = seeded(vec![task_named("a", "ou_me")]);
+        let in_flight = store.begin_poll(2_000).unwrap();
+
+        store.fold_deleted("rec_a");
+
+        store.end_poll();
+        assert!(!store.apply_poll(vec![task_named("a", "ou_me")], in_flight, 3_000));
+        assert!(store.snapshot(&me()).tasks.is_empty(), "the deleted row must stay gone");
+    }
+
+    #[test]
+    fn a_walk_in_flight_when_a_row_is_created_cannot_drop_it() {
+        let mut store = seeded(vec![task_named("a", "ou_me")]);
+        let in_flight = store.begin_poll(2_000).unwrap();
+
+        store.fold_created(task_named("b", "ou_me"));
+
+        store.end_poll();
+        assert!(!store.apply_poll(vec![task_named("a", "ou_me")], in_flight, 3_000));
+        assert_eq!(store.snapshot(&me()).tasks.len(), 2, "the new row must not vanish");
+    }
+
+    #[test]
+    fn a_session_starts_on_the_slow_path_until_the_filter_is_proven() {
+        let store = seeded(vec![]);
+        assert_eq!(store.fetch_mode(), FetchMode::FullWalk);
+    }
+
+    #[test]
+    fn ownership_is_answerable_from_the_store_without_a_network_call() {
+        let store = seeded(vec![task_named("mine", "ou_me"), task_named("theirs", "ou_x")]);
+        assert_eq!(store.ownership_of("rec_mine", &me()), Some(true));
+        assert_eq!(store.ownership_of("rec_theirs", &me()), Some(false));
+        assert_eq!(store.ownership_of("rec_never_seen", &me()), None);
     }
 
     #[test]

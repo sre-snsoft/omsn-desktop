@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import type { Pin, Snapshot, Task, UiError, Viewer } from './types';
 import { formatClock, initials, pinTask, sortTasks } from './types';
 import { TaskRow } from './TaskRow';
@@ -10,11 +11,20 @@ import './App.css';
 /** How often to re-read the Base, while the window has focus. */
 const POLL_INTERVAL_MS = 20_000;
 
-/** While a write is in flight, re-read the local snapshot this often.
- *  `refresh: false` touches no network — it only asks Rust what it now
- *  believes — so a confirmation or a rejection shows up in well under a
- *  second instead of at the next 20 s poll. */
-const SETTLE_POLL_MS = 400;
+/** Rust emits this the moment a write settles, so the in-flight marker clears
+ *  on the answer rather than on the next tick of a timer. `core:app:default`
+ *  already grants `allow-register-listener`; no capability change. */
+const WRITE_SETTLED_EVENT = 'omsn://write-settled';
+
+/** Backstop for an event that never arrives. Deliberately not a backoff: the
+ *  read it performs is a pure in-memory call with no network behind it, so
+ *  making later feedback slower would buy nothing and cost the user. */
+const SETTLE_BACKSTOP_MS = 1_000;
+
+/** Two network refreshes closer together than this are the same intent — a
+ *  window being alt-tabbed, or a finger on the refresh button. The widget is
+ *  always on top, so focus flaps constantly. */
+const MIN_REFRESH_GAP_MS = 2_000;
 
 /** Stop chasing a write that has not settled in this long. Past that it is
  *  the store's 60 s overlay timeout's problem, not the UI's. */
@@ -37,6 +47,7 @@ export default function App() {
   const [draft, setDraft] = useState('');
   const [adding, setAdding] = useState(false);
   const [confirmDone, setConfirmDone] = useState<Task | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<Task | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [pin, setPin] = useState<Pin | null>(null);
   // A rejected write is reported separately from `error`: a poll succeeding
@@ -56,7 +67,17 @@ export default function App() {
   );
   const pager = usePagination(tasks);
 
+  // When the last network refresh was asked for, so three unthrottled
+  // triggers cannot stack walks. A ref, not state: changing it must not
+  // re-render, and `load` must not be rebuilt by it.
+  const lastRefreshAt = useRef(0);
+
   const load = useCallback(async (refresh: boolean) => {
+    if (refresh) {
+      const at = Date.now();
+      if (at - lastRefreshAt.current < MIN_REFRESH_GAP_MS) return;
+      lastRefreshAt.current = at;
+    }
     try {
       setSnapshot(await invoke<Snapshot>('list_my_tasks', { refresh }));
       setError(null);
@@ -116,8 +137,22 @@ export default function App() {
     };
   }, [viewer, load]);
 
-  // Chase a write until Rust reports it settled, so a rejection surfaces in
-  // under a second rather than whenever the next 20 s poll happens to land.
+  // Rust tells us the instant a write settles. `refresh: false` asks only what
+  // Rust already believes, so this costs no network at all.
+  useEffect(() => {
+    // Caught here rather than in the cleanup: a listener that cannot be
+    // registered is not worth an error notice over someone's tasks, and the
+    // backstop below covers it.
+    const listening = listen(WRITE_SETTLED_EVENT, () => {
+      void load(false);
+    }).catch(() => null);
+    return () => {
+      void listening.then((stop) => stop?.());
+    };
+  }, [load]);
+
+  // A missed or duplicated event must not strand a row dimmed forever, so a
+  // slow read keeps running while anything is still in flight.
   const settling = (snapshot?.pending_ids.length ?? 0) > 0;
   useEffect(() => {
     if (!settling) return;
@@ -128,9 +163,20 @@ export default function App() {
         return;
       }
       void load(false);
-    }, SETTLE_POLL_MS);
+    }, SETTLE_BACKSTOP_MS);
     return () => window.clearInterval(timer);
   }, [settling, load]);
+
+  // Escape dismisses the delete confirm, like clicking the backdrop. The
+  // destructive path must always have a way out that needs no aim.
+  useEffect(() => {
+    if (!confirmDelete) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setConfirmDelete(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [confirmDelete]);
 
   // A write the Base refused. The command returned before the answer arrived,
   // so this is the only place the user can be told — never skip it.
@@ -159,18 +205,24 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  /// Hold a row in the slot it was in: any write moves `Modified`, and the
+  /// sort orders within a status group by `Modified` ascending, so the row
+  /// the user just touched would otherwise jump to the bottom of the list.
+  const pinRow = (task: Task) => {
+    const index = tasks.findIndex((t) => t.record_id === task.record_id);
+    if (index < 0) return;
+    setPin({
+      recordId: task.record_id,
+      index,
+      fetchedAt: snapshot?.fetched_at_millis ?? 0,
+    });
+  };
+
   const setStatus = async (task: Task, status: string) => {
     setWriteError(null);
-    // Hold the row in the slot it was clicked in. Done is exempt: it leaves
-    // the active list entirely, so there is nothing to hold.
-    const index = tasks.findIndex((t) => t.record_id === task.record_id);
-    if (status !== 'Done' && index >= 0) {
-      setPin({
-        recordId: task.record_id,
-        index,
-        fetchedAt: snapshot?.fetched_at_millis ?? 0,
-      });
-    }
+    // Done is exempt: it leaves the active list entirely, so there is nothing
+    // to hold in place.
+    if (status !== 'Done') pinRow(task);
     try {
       // Returns as soon as Rust has overlaid the change; the PUT continues in
       // the background and settles itself.
@@ -184,6 +236,48 @@ export default function App() {
     } catch (err) {
       setPin(null);
       setError(err as UiError);
+    }
+  };
+
+  /// Fix a typo in a title. Only `title` travels, so a concurrent plugin edit
+  /// to any other column on the same record is not clobbered.
+  ///
+  /// Resolves false when the write was refused, so the editor stays open on
+  /// the text the user typed. A blank title is refused in Rust by
+  /// `TaskPatch::validate`, and the reason is shown rather than swallowed.
+  const renameTask = async (task: Task, title: string): Promise<boolean> => {
+    setWriteError(null);
+    const next = title.trim();
+    if (next === task.title) return true;
+    pinRow(task);
+    try {
+      setSnapshot(
+        await invoke<Snapshot>('update_task', {
+          recordId: task.record_id,
+          patch: { title: next },
+        })
+      );
+      setToast(`Renamed: ${next}`);
+      return true;
+    } catch (err) {
+      setPin(null);
+      setWriteError((err as UiError).message);
+      return false;
+    }
+  };
+
+  /// Irreversible, and confirmed before it gets here. Unlike a status change
+  /// this waits for the Base: a row that vanished optimistically and then
+  /// came back would be worse than a moment's delay.
+  const removeTask = async (task: Task) => {
+    setWriteError(null);
+    try {
+      setSnapshot(await invoke<Snapshot>('delete_task', { recordId: task.record_id }));
+      setPin(null);
+      setExpandedId(null);
+      setToast(`Deleted: ${task.title}`);
+    } catch (err) {
+      setWriteError((err as UiError).message);
     }
   };
 
@@ -320,6 +414,8 @@ export default function App() {
               onToggleExpand={(id) => setExpandedId((current) => (current === id ? null : id))}
               onSetStatus={(t, s) => void setStatus(t, s)}
               onAskDone={setConfirmDone}
+              onRename={renameTask}
+              onAskDelete={setConfirmDelete}
             />
           ))}
         </ul>
@@ -343,6 +439,42 @@ export default function App() {
                 }}
               >
                 YES
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmDelete && (
+        <div className="confirm" onClick={() => setConfirmDelete(null)}>
+          <div className="confirm__box" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm__title">DELETE FOREVER?</div>
+            <div className="confirm__task">{confirmDelete.title}</div>
+            {/* Worded as permanent on purpose: whether this Base keeps a
+                recoverable trash has not been established, and the copy must
+                not promise an undo nobody has verified exists. */}
+            <div className="confirm__warn">
+              This removes the record from the team Base. It cannot be undone from this app.
+            </div>
+            <div className="confirm__row">
+              <button
+                className="pixel-btn pixel-btn--ghost"
+                autoFocus
+                onClick={() => setConfirmDelete(null)}
+              >
+                CANCEL
+              </button>
+              {/* Reads DELETE, not YES: muscle memory from MARK AS DONE? must
+                  not be able to destroy a record. */}
+              <button
+                className="pixel-btn pixel-btn--danger"
+                onClick={() => {
+                  const task = confirmDelete;
+                  setConfirmDelete(null);
+                  void removeTask(task);
+                }}
+              >
+                DELETE
               </button>
             </div>
           </div>

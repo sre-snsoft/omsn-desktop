@@ -22,6 +22,7 @@ function task(over: Partial<Task> = {}): Task {
     workstream: null,
     remarks: null,
     due_date: null,
+    completed_date: null,
     created: null,
     modified: null,
     ...over,

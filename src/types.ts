@@ -21,6 +21,9 @@ export interface Task {
   workstream: string | null;
   remarks: string | null;
   due_date: number | null;
+  /** The day the task was completed, written when a client sets Done.
+   *  Null for anything finished by hand in the Lark UI — not guessed at. */
+  completed_date: number | null;
   created: number | null;
   modified: number | null;
 }
@@ -53,6 +56,8 @@ export interface TaskPatch {
   priority?: string | null;
   remarks?: string | null;
   owner_ids?: string[] | null;
+  /** Epoch millis, and decided in Rust. The UI never sets this. */
+  completed_date?: number | null;
 }
 
 /** Status values as stored in the Base, in the order they matter at standup. */

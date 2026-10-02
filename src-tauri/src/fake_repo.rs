@@ -5,6 +5,7 @@
 //! to make a request *take time* — a poll that returns instantly cannot show
 //! whether a click queued behind it.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -24,6 +25,15 @@ pub struct FakeRepo {
     pub list_delay: Mutex<Duration>,
     pub update_delay: Mutex<Duration>,
     pub list_calls: AtomicUsize,
+    /// Calls to the server-side Owner filter. Separate from `list_calls` so a
+    /// test can see *which* path a poll took — that is how the cross-check's
+    /// fallback decision is observed.
+    pub search_calls: AtomicUsize,
+    /// Record ids the server-side filter fails to return even though the
+    /// viewer owns them. Stands in for the unverified multi-owner behaviour:
+    /// `Owner` is `multiple: true` and it is not known whether Lark's `is`
+    /// operator matches a row the viewer co-owns.
+    pub filter_blind_to: Mutex<HashSet<String>>,
 }
 
 impl FakeRepo {
@@ -36,11 +46,26 @@ impl FakeRepo {
             list_delay: Mutex::new(Duration::ZERO),
             update_delay: Mutex::new(Duration::ZERO),
             list_calls: AtomicUsize::new(0),
+            search_calls: AtomicUsize::new(0),
+            filter_blind_to: Mutex::new(HashSet::new()),
         }
     }
 
     pub fn sent_patches(&self) -> Vec<TaskPatch> {
         self.patches.lock().unwrap().clone()
+    }
+
+    /// Make the server-side filter silently omit a row the viewer owns.
+    pub fn hide_from_filter(&self, record_id: &str) {
+        self.filter_blind_to.lock().unwrap().insert(record_id.to_string());
+    }
+
+    pub fn walks(&self) -> usize {
+        self.list_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn searches(&self) -> usize {
+        self.search_calls.load(Ordering::SeqCst)
     }
 
     /// Read a `Mutex` and drop the guard before any `await`: a std guard held
@@ -53,6 +78,9 @@ impl FakeRepo {
 impl TaskRepository for FakeRepo {
     async fn list_all(&self) -> Result<Vec<Task>> {
         self.list_calls.fetch_add(1, Ordering::SeqCst);
+        // Read first, *then* wait. A walk reports the table as it was when it
+        // left, which is the whole reason a slow one can revert a fast write.
+        let snapshot = self.tasks.lock().unwrap().clone();
         let delay = Self::delay(&self.list_delay);
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
@@ -60,15 +88,45 @@ impl TaskRepository for FakeRepo {
         if *self.fail_next.lock().unwrap() {
             return Err(CoreError::Unauthorized);
         }
-        Ok(self.tasks.lock().unwrap().clone())
+        Ok(snapshot)
+    }
+
+    async fn list_owned_by(&self, open_id: &str) -> Result<Vec<Task>> {
+        self.search_calls.fetch_add(1, Ordering::SeqCst);
+        let blind = self.filter_blind_to.lock().unwrap().clone();
+        let matched: Vec<Task> = self
+            .tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| !blind.contains(&t.record_id))
+            .filter(|t| t.owners.iter().any(|p| p.id == open_id))
+            .cloned()
+            .collect();
+        let delay = Self::delay(&self.list_delay);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if *self.fail_next.lock().unwrap() {
+            return Err(CoreError::Unauthorized);
+        }
+        Ok(matched)
     }
 
     async fn create(&self, patch: &TaskPatch) -> Result<Task> {
+        let delay = Self::delay(&self.update_delay);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if *self.fail_next.lock().unwrap() {
+            return Err(CoreError::Forbidden);
+        }
         let mut task = task_named("new", "ou_me");
         task.record_id = "rec_new".into();
         if let Some(t) = &patch.title {
             task.title = t.clone();
         }
+        self.tasks.lock().unwrap().push(task.clone());
         Ok(task)
     }
 
@@ -94,7 +152,15 @@ impl TaskRepository for FakeRepo {
         Ok(updated)
     }
 
-    async fn delete(&self, _record_id: &str) -> Result<()> {
+    async fn delete(&self, record_id: &str) -> Result<()> {
+        let delay = Self::delay(&self.update_delay);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if *self.fail_next.lock().unwrap() {
+            return Err(CoreError::Forbidden);
+        }
+        self.tasks.lock().unwrap().retain(|t| t.record_id != record_id);
         Ok(())
     }
 }
@@ -110,6 +176,7 @@ pub fn task_named(title: &str, owner: &str) -> Task {
         workstream: None,
         remarks: None,
         due_date: None,
+        completed_date: None,
         created: Some(1_000),
         modified: Some(1_000),
     }
