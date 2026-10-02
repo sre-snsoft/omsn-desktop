@@ -5,11 +5,11 @@
 //! with a code. Ported from `probe/lark_auth.py`, which proved this exact
 //! exchange against the live tenant.
 //!
-//! PKCE does the real work here. Lark accepts the exchange as a public client,
-//! so no client secret ships with the app — which is what lets a teammate run
-//! it with nothing configured. PKCE is then the only thing binding the code to
-//! this process, so another local program cannot race the loopback redirect
-//! and redeem a stolen code.
+//! PKCE is sent, but it does not replace client authentication: Lark refuses a
+//! secret-less exchange with invalid_client ("The auth method is not
+//! supported"), so this app is a confidential client. PKCE still earns its
+//! place — it stops another local process that races the loopback redirect
+//! from redeeming a stolen code.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -308,6 +308,7 @@ pub async fn exchange(
         .json(&serde_json::json!({
             "grant_type": "authorization_code",
             "client_id": cfg.app_id,
+            "client_secret": cfg.app_secret,
             "code": code,
             "redirect_uri": pending.redirect,
             "code_verifier": pending.verifier,
@@ -375,6 +376,11 @@ pub fn validate_redirect(redirect: &str) -> Result<()> {
     Ok(())
 }
 
+/// A recognisable value so a test can assert the secret never appears in a
+/// URL, an error message, or the callback page.
+#[cfg(test)]
+const SENTINEL_SECRET: &str = "SECRET-sentinel-9f3c1";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +390,7 @@ mod tests {
             base_token: "bas".into(),
             table_id: "tbl".into(),
             app_id: "cli_test".into(),
+            app_secret: SENTINEL_SECRET.into(),
             oauth_redirect: "http://127.0.0.1:8765/callback".into(),
         }
     }
@@ -471,13 +478,13 @@ mod hardening {
     use std::net::TcpStream;
     use std::sync::mpsc;
 
-    const SENTINEL_SECRET: &str = "SECRET-sentinel-9f3c1";
 
     fn cfg() -> AppConfig {
         AppConfig {
             base_token: "bascnTEST".into(),
             table_id: "tblTEST".into(),
             app_id: "cli_test".into(),
+            app_secret: SENTINEL_SECRET.into(),
             oauth_redirect: "http://127.0.0.1:8765/callback".into(),
         }
     }

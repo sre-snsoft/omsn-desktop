@@ -113,6 +113,9 @@ pub async fn sign_in(state: State<'_, AppState>) -> std::result::Result<Viewer, 
 pub async fn authorize(state: State<'_, AppState>) -> std::result::Result<Viewer, UiError> {
     let _lock = state.connecting.lock().await;
     let cfg = AppConfig::load()?;
+    // Fail with something actionable before opening a browser the user would
+    // consent in for nothing.
+    cfg.ready_to_sign_in()?;
 
     // A non-loopback redirect would send the code to someone else while we
     // waited locally and timed out, so refuse before opening a browser.

@@ -110,11 +110,12 @@ fn set_owner_only(_path: &std::path::Path) -> Result<()> {
 
 /// Exchange a refresh token for a new pair. The refresh token rotates, so the
 /// caller must persist the result.
-/// Lark accepts this as a public client — no client secret — which is why the
-/// app can ship with nothing secret in it. Verified against the live tenant.
+/// Lark requires client authentication here; a secret-less refresh is refused
+/// with invalid_client. Verified against the live tenant.
 pub async fn refresh(
     http: &reqwest::Client,
     app_id: &str,
+    app_secret: &str,
     refresh_token: &str,
     now_secs: i64,
 ) -> Result<TokenSet> {
@@ -126,6 +127,7 @@ pub async fn refresh(
         .json(&serde_json::json!({
             "grant_type": "refresh_token",
             "client_id": app_id,
+            "client_secret": app_secret,
             "refresh_token": refresh_token,
         }))
         .send()
@@ -273,7 +275,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_with_an_empty_token_fails_locally() {
         let http = reqwest::Client::new();
-        let err = refresh(&http, "id", "", 0).await.unwrap_err();
+        let err = refresh(&http, "id", "secret", "", 0).await.unwrap_err();
         assert!(matches!(err, CoreError::Auth(_)));
     }
 }
