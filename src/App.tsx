@@ -6,6 +6,7 @@ import { formatClock, initials, pinTask, sortTasks } from './types';
 import { TaskRow } from './TaskRow';
 import { useAppVersion, useNow } from './useChrome';
 import { usePagination } from './usePagination';
+import { Settings } from './Settings';
 import './App.css';
 
 /** How often to re-read the Base, while the window has focus. */
@@ -47,6 +48,7 @@ export default function App() {
   const [draft, setDraft] = useState('');
   const [adding, setAdding] = useState(false);
   const [confirmDone, setConfirmDone] = useState<Task | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<Task | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [pin, setPin] = useState<Pin | null>(null);
@@ -306,7 +308,7 @@ export default function App() {
   const who = initials(viewer?.display_name);
 
   return (
-    <div className="app">
+    <div className={`app ${showSettings ? 'app--behind-sheet' : ''}`}>
       <header className="titlebar" data-tauri-drag-region>
         <span className="titlebar__name" data-tauri-drag-region>
           OMSN
@@ -323,6 +325,13 @@ export default function App() {
           title="Refresh"
         >
           ↻
+        </button>
+        <button
+          className="pixel-btn pixel-btn--ghost"
+          onClick={() => setShowSettings(true)}
+          title="Settings"
+        >
+          ⚙
         </button>
       </header>
 
@@ -479,6 +488,14 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {showSettings && (
+        <Settings
+          viewer={viewer}
+          version={version}
+          onClose={() => setShowSettings(false)}
+        />
       )}
 
       {toast && <div className="toast">{toast}</div>}

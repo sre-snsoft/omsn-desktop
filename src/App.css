@@ -549,3 +549,130 @@ button {
     display: none;
   }
 }
+
+/* ── Settings sheet ──────────────────────────────────────────────────
+   Overlays the whole window and blurs what is behind it, so the panel
+   reads as modal without needing a second window. */
+.app--behind-sheet > .titlebar,
+.app--behind-sheet > .add,
+.app--behind-sheet > .list,
+.app--behind-sheet > .pager,
+.app--behind-sheet > .notice {
+  filter: blur(3px);
+  pointer-events: none;
+  user-select: none;
+}
+
+.sheet {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 14px;
+  overflow-y: auto;
+  background: color-mix(in srgb, var(--shadow) 72%, transparent);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+}
+
+.sheet__box {
+  width: 100%;
+  background: var(--bg-raised);
+  border: 2px solid var(--shadow);
+  box-shadow: 4px 4px 0 var(--shadow);
+  padding: 12px;
+}
+
+.sheet__head {
+  display: flex;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.sheet__title {
+  font-size: 12px;
+  text-shadow: 2px 2px 0 var(--shadow);
+}
+
+.sheet__head button {
+  margin-left: auto;
+}
+
+.card {
+  border: 2px solid var(--line);
+  background: var(--panel);
+  padding: 10px;
+  margin-bottom: 10px;
+}
+
+.card__title {
+  font-size: 9px;
+  color: var(--accent-bright);
+  margin-bottom: 8px;
+}
+
+.card__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 9px;
+}
+
+.card__muted {
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.8;
+}
+
+.card__status {
+  font-size: 9px;
+  line-height: 1.8;
+  margin-top: 8px;
+  word-break: break-word;
+}
+
+/* Release notes are upstream text: cap the height rather than let the
+   panel grow without bound. */
+.card__notes {
+  margin-top: 8px;
+  padding: 8px;
+  max-height: 96px;
+  overflow-y: auto;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.9;
+  white-space: pre-wrap;
+}
+
+.card__actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  background: var(--accent);
+  border: 2px solid var(--shadow);
+  color: #fff;
+  font-size: 8px;
+  flex: 0 0 auto;
+}
+
+.ok {
+  color: var(--ok);
+}
+.warn {
+  color: var(--warn);
+}
+.bad {
+  color: var(--danger);
+}
