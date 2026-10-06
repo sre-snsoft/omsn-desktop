@@ -10,7 +10,7 @@
 # the extra few minutes this costs.
 set -euo pipefail
 
-RELEASE_REPO="sre-snsoft/omsn-desktop-releases"
+RELEASE_REPO="sre-snsoft/omsn-desktop"
 KEY_PATH="$HOME/.config/omsn/updater.key"
 DRY_RUN=false
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=true

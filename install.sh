@@ -5,7 +5,7 @@
 # Downloads the latest release, installs it, and writes the config the app
 # needs. One paste, no manual steps.
 #
-#   curl -fsSL https://raw.githubusercontent.com/sre-snsoft/omsn-desktop-releases/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/sre-snsoft/omsn-desktop/main/install.sh | bash
 #
 # Why this exists rather than "drag the .dmg to Applications":
 #   * The app is not signed with an Apple Developer certificate, so a bundle
@@ -16,7 +16,7 @@
 #     one on disk. Doing it here avoids asking 14 people to hand-edit a file.
 set -euo pipefail
 
-REPO="sre-snsoft/omsn-desktop-releases"
+REPO="sre-snsoft/omsn-desktop"
 APP_NAME="OMSN Desktop.app"
 CONFIG_DIR="$HOME/.config/omsn"
 ENV_FILE="$CONFIG_DIR/desktop.env"
