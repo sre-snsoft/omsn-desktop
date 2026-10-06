@@ -51,12 +51,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-say "Finding the latest release…"
-DMG_URL=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-          | grep -o "https://[^\"]*${ASSET_ARCH}[^\"]*\.dmg" | head -1)
-[ -n "$DMG_URL" ] || fail "No .dmg found for $ASSET_ARCH in the latest release of $REPO."
+# Deliberately avoids api.github.com. Its unauthenticated limit is 60 requests
+# per hour PER IP, so a team behind one office address can exhaust it between
+# them and every install then fails with a bare 403. The releases/latest
+# download redirect needs no API call and no token.
+LATEST="https://github.com/$REPO/releases/latest/download"
 
-say "Downloading $(basename "$DMG_URL")…"
+say "Finding the latest release…"
+VERSION=$(curl -fsSL "$LATEST/latest.json" \
+          | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+[ -n "$VERSION" ] || fail "Could not read the update manifest from $REPO."
+
+DMG_URL="$LATEST/OMSN.Desktop_${VERSION}_${ASSET_ARCH}.dmg"
+curl -fsSL -o /dev/null -I "$DMG_URL" 2>/dev/null \
+  || fail "Release v$VERSION has no build for $ASSET_ARCH (this Mac is $(uname -m))."
+
+say "Downloading v${VERSION} for ${ASSET_ARCH}…"
 curl -fsSL --progress-bar "$DMG_URL" -o "$WORK/omsn.dmg" || fail "Download failed."
 
 say "Installing to /Applications…"
