@@ -2,15 +2,26 @@
 
 Living handoff note. Update it when something here stops being true.
 
-Last updated: 2026-10-06 · branch **`omsn-desktop`** · pushed
+Last updated: 2026-10-06 · repo **`sre-snsoft/omsn-desktop`** (public) · branch `main`
 Tests: **172 Rust** (`cd desktop/src-tauri && cargo test --lib`) · **67 frontend** (`cd desktop && npm test`) · 0 warnings
 
-## Branch
+## Where things live
 
-`omsn-desktop` is the **permanent working branch** for this app, not a feature
-branch awaiting a merge. It is never merged into `platform` or `main`: the
-desktop app and the OMSN plugin share a repository but ship on their own
-cadence, and the plugin's marketplace consumers read `platform`.
+| | |
+|---|---|
+| Source, releases, installer | **`sre-snsoft/omsn-desktop`** (public), branch `main` |
+| The OMSN Claude plugin | `sre-snsoft/task-management` — a *separate* writer to the same Base |
+| Signing key | `~/.config/omsn/updater.key` — in no repository, unrecoverable |
+
+The app was extracted from `task-management` with `git subtree`, so its
+history came with it. It is public because the Tauri updater fetches plain
+URLs and cannot authenticate — a private repo would need a second public one
+just to host artifacts, or a token shipped in the binary. Audited before the
+move: no credentials in the tree. The app id and Base ids are identifiers, not
+secrets; reading the data still needs the viewer's own Lark session.
+
+`task-management@omsn-desktop` remains only as an archive of where this came
+from. Nothing merges.
 
 ## What this is
 
