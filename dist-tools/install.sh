@@ -46,7 +46,7 @@ esac
 WORK="$(mktemp -d)"
 cleanup() {
   # Detach before removing, or the mount point lingers.
-  [ -n "${MOUNTED:-}" ] && hdiutil detach "$MOUNTED" -quiet 2>/dev/null || true
+  [ -n "${MOUNTED:-}" ] && hdiutil detach "$MOUNTED" -force -quiet 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
