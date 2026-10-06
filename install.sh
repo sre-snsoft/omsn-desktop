@@ -45,8 +45,13 @@ esac
 
 WORK="$(mktemp -d)"
 cleanup() {
-  # Detach before removing, or the mount point lingers.
+  # Detach before removing, or the mount point lingers. Falling back to the
+  # name pattern matters: an early failure can leave a volume attached before
+  # MOUNTED was ever set, and those accumulate as "OMSN Desktop 1", "2"…
   [ -n "${MOUNTED:-}" ] && hdiutil detach "$MOUNTED" -force -quiet 2>/dev/null || true
+  for stray in /Volumes/OMSN\ Desktop*; do
+    [ -d "$stray" ] && hdiutil detach "$stray" -force -quiet 2>/dev/null || true
+  done
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -70,9 +75,24 @@ say "Downloading v${VERSION} for ${ASSET_ARCH}…"
 curl -fsSL --progress-bar "$DMG_URL" -o "$WORK/omsn.dmg" || fail "Download failed."
 
 say "Installing to /Applications…"
-MOUNTED=$(hdiutil attach "$WORK/omsn.dmg" -nobrowse -quiet \
-          | grep -o '/Volumes/.*' | head -1)
-[ -n "$MOUNTED" ] || fail "Could not mount the disk image."
+# Parse the plist rather than scraping stdout: `-quiet` silences the very
+# text a grep would read, which left MOUNTED empty — and with `pipefail` the
+# failing grep aborted the script before the check below could report it.
+MOUNT_PLIST="$WORK/mount.plist"
+hdiutil attach "$WORK/omsn.dmg" -nobrowse -readonly -plist > "$MOUNT_PLIST" 2>/dev/null \
+  || fail "Could not mount the disk image."
+MOUNTED=$(python3 - "$MOUNT_PLIST" <<'PLIST'
+import plistlib, sys
+with open(sys.argv[1], "rb") as fh:
+    entities = plistlib.load(fh).get("system-entities", [])
+for e in entities:
+    point = e.get("mount-point")
+    if point:
+        print(point)
+        break
+PLIST
+)
+[ -n "$MOUNTED" ] || fail "Disk image mounted but reported no mount point."
 [ -d "$MOUNTED/$APP_NAME" ] || fail "'$APP_NAME' not found inside the image."
 
 # Quit a running copy, or the replace fails with a busy bundle.
