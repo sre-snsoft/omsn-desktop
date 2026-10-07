@@ -6,6 +6,14 @@ team's Lark tracker.<br>
 Add, start, finish and tidy your own work without opening Lark.
 </p>
 
+<p align="center">
+  <img src="docs/assets/omsn-ui.png" alt="OMSN Desktop" width="520">
+</p>
+
+<p align="center">
+  <i>Floats above your other windows. Resize it; the list fits itself.</i>
+</p>
+
 ---
 
 # Install
@@ -88,6 +96,12 @@ quarantines anything a *browser* downloads — so a hand-dragged `.dmg` is
 refused as "unidentified developer". The installer places the app and clears
 that flag before first launch, so the dialog never appears. Updates are
 delivered by the app itself and are unaffected.
+
+### How it works
+
+**[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — what the Rust core owns and
+why, how a click repaints before the network answers, and how reads stay
+correct when the OMSN plugin is writing to the same table.
 
 ### Develop
 
